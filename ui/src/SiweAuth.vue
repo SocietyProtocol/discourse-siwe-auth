@@ -1,6 +1,11 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { useConnection, useDisconnect, useSignMessage } from '@wagmi/vue'
+import { useConnection, useDisconnect, useSignTypedData } from '@wagmi/vue'
+import {
+  lightAccountAddress,
+  lightAccountSignRequest,
+  wrapLightAccountSignature,
+} from './lightAccount'
 import { Button, Loading } from '@1001-digital/components'
 import { EvmAccount, EvmConnect } from '@1001-digital/components.evm'
 
@@ -14,7 +19,7 @@ const status = ref<'idle' | 'signing' | 'submitting' | 'error'>('idle')
 const errorMessage = ref('')
 
 const { address, chainId, isConnected, connector } = useConnection()
-const { mutateAsync: signMessageAsync } = useSignMessage()
+const { mutateAsync: signTypedDataAsync } = useSignTypedData()
 const { mutate: disconnectAccount } = useDisconnect()
 
 const disconnect = () => {
@@ -68,9 +73,17 @@ async function signIn() {
   errorMessage.value = ''
 
   try {
-    const message = await fetchSiweMessage(address.value, chainId.value)
-
-    const signature = await signMessageAsync({ message })
+    const owner = address.value
+    const societyAccount = lightAccountAddress(owner)
+    const message = await fetchSiweMessage(societyAccount, chainId.value)
+    const request = lightAccountSignRequest(owner, message)
+    const ownerSignature = await signTypedDataAsync({
+      domain: { ...request.domain, chainId: chainId.value },
+      types: request.types,
+      primaryType: request.primaryType,
+      message: request.message,
+    })
+    const signature = wrapLightAccountSignature(owner, ownerSignature)
 
     status.value = 'submitting'
     submitForm(message, signature)
