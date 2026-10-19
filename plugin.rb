@@ -116,10 +116,13 @@ class ::SiweAuthenticator < ::Auth::ManagedAuthenticator
   end
 
   def after_authenticate(auth_token, existing_account: nil)
+    adopt_case_insensitive_uid(auth_token)
     result = super
 
     wallet = auth_token&.uid&.downcase
     return result unless wallet.present?
+
+    owner = auth_token[:extra]&.[](:owner_address)&.downcase
 
     info = auth_token[:info] || {}
     ens_name   = info[:nickname].presence
@@ -128,7 +131,8 @@ class ::SiweAuthenticator < ::Auth::ManagedAuthenticator
 
     if result.user
       cf = result.user.custom_fields
-      cf['wallet_address'] ||= wallet
+      cf['wallet_address'] = wallet
+      cf['siwe_owner_address'] = owner if owner
       cf['ens_name']   = ens_name   if ens_name
       cf['ens_avatar'] = ens_avatar if ens_avatar
       cf['preferred_identity'] ||= DiscourseSiwe::IdentityStore.default_preference(cf)
@@ -140,6 +144,7 @@ class ::SiweAuthenticator < ::Auth::ManagedAuthenticator
     else
       result.extra_data = (result.extra_data || {}).merge(
         wallet_address: wallet,
+        owner_address: owner,
         ens_name: ens_name,
         ens_avatar: ens_avatar,
       )
@@ -161,8 +166,10 @@ class ::SiweAuthenticator < ::Auth::ManagedAuthenticator
     user.custom_fields['wallet_address'] = wallet.downcase
     user.custom_fields['ens_name']       = extra['ens_name']   || extra[:ens_name]
     user.custom_fields['ens_avatar']     = extra['ens_avatar'] || extra[:ens_avatar]
+    owner = extra['owner_address'] || extra[:owner_address]
+    user.custom_fields['siwe_owner_address'] = owner if owner.present?
 
-    society = DiscourseSiwe::IdentityResolver.resolve(wallet)
+    society = DiscourseSiwe::IdentityResolver.resolve_with_owner(wallet, owner)
     DiscourseSiwe::IdentityStore.store_society(user, society)
     user.custom_fields['preferred_identity'] =
       DiscourseSiwe::IdentityStore.default_preference(user.custom_fields)
@@ -170,6 +177,22 @@ class ::SiweAuthenticator < ::Auth::ManagedAuthenticator
 
     DiscourseSiwe::DisplayNameApplier.apply(user)
     user.save!
+  end
+
+  private
+
+  # Discourse looks up provider_uid exactly and uid is now always EIP-55
+  # checksummed. Adopt a single legacy row stored in another case (e.g. a
+  # lowercase rewrite) so its owner signs in to the same user.
+  def adopt_case_insensitive_uid(auth_token)
+    uid = auth_token&.uid
+    return if uid.blank?
+
+    scope = UserAssociatedAccount.where(provider_name: name)
+    return if scope.exists?(provider_uid: uid)
+
+    rows = scope.where('lower(provider_uid) = ?', uid.downcase).limit(2).to_a
+    rows.first.update!(provider_uid: uid) if rows.size == 1
   end
 end
 
@@ -180,6 +203,7 @@ auth_provider authenticator: ::SiweAuthenticator.new,
 
 after_initialize do
   load File.expand_path('../lib/discourse_siwe/eth_rpc.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/light_account.rb', __FILE__)
   load File.expand_path('../lib/discourse_siwe/ens_resolver.rb', __FILE__)
   load File.expand_path('../lib/discourse_siwe/identity_resolver.rb', __FILE__)
   load File.expand_path('../lib/discourse_siwe/identity_store.rb', __FILE__)

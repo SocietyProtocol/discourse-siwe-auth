@@ -10,6 +10,7 @@ module DiscourseSiwe
       wallet_address ens_name ens_avatar
       society_badge_id society_name society_avatar society_bio
       preferred_identity society_resolved_at
+      siwe_owner_address
     ].freeze
 
     def store_society(user, society)
