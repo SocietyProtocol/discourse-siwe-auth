@@ -239,7 +239,13 @@ suite.
 ```bash
 ruby test/ens_unit_test.rb
 ruby test/society_unit_test.rb
+ruby test/light_account_unit_test.rb
 ```
+
+`test/light_account_unit_test.rb` checks the Light Account derivation against
+every pair in `script/forum-address-map.json` and the rewrite planner. Without
+the `keccak` gem it falls back to a pure-Ruby Keccak (`test/support/`); the
+other scripts can use it too: `ruby -rtime -r ./test/support/pure_keccak test/society_unit_test.rb`.
 
 ### Integration tests (require an Ethereum RPC endpoint)
 
@@ -287,7 +293,10 @@ them in user custom fields:
   from the ENS metadata service.
 - `society_badge_id` / `society_name` / `society_avatar` / `society_bio` —
   resolved from Society Protocol using the configured subgraph (default) or
-  direct RPC fallback.
+  direct RPC fallback. When the Light Account has no profile yet, the owner
+  EOA's profile is used.
+- `siwe_owner_address` — the EOA that owns the Light Account, read from the
+  EIP-6492 signature (only when CREATE2 ties it to the signing address).
 
 A default `preferred_identity` is chosen automatically: Society if available,
 otherwise ENS, otherwise wallet. `DisplayNameApplier` then applies it to
@@ -331,6 +340,122 @@ bundle exec rake siwe:migrate_identities[true]
 The task resolves ENS and Society identities, sets the default preference, and
 stores the result in user custom fields. Existing display names are left
 untouched unless the user toggles their preferred identity.
+
+### Moving forum users to Light Accounts
+
+Members sign in as their Light Account `S` (owned by their wallet `E`), not
+as `E`. The SIWE `uid` is always the EIP-55 checksummed address, and Discourse
+matches it exactly. Existing users must be moved from `E` to `S` **before**
+the Light Account login goes live, otherwise their next sign-in creates a new,
+empty forum user for `S`. That login is in every build of this branch from
+`8a4f838` on, not only the final one: check step 0 before assuming it has not
+shipped.
+
+`script/rewrite_smart_account_users.rb` covers every `siwe` account on the
+forum (not only Outpost members). For each one it derives `S` in Ruby, then:
+
+- sets `provider_uid` to checksummed `S`, and `nickname` / `name` in the
+  account's `info` when they held `E`;
+- sets the `wallet_address` custom field to `S` and `siwe_owner_address` to `E`;
+- renames a wallet-style display name (`0x9ba7…7c3c`) to `S`'s short form.
+
+It refuses to run unless its derivation matches every pair in
+`script/forum-address-map.json` (flat or chain-keyed). It skips rows that are
+already Light Accounts (re-runs are no-ops), contract wallets (`eth_getCode`),
+and, with `SUSPECT_AFTER`, rows created after a given time. A row whose uid is
+a Light Account from the map is never rewritten, even with no
+`siwe_owner_address`: it is `adopt` (records `E`) or `recase` (fixes the case
+and records `E`). A uid that is not checksummed and is not in the map is left
+as `review`, since only a script or a hand edit writes another case. If someone
+already signed in as `S` (a duplicate user), it changes neither row and
+prints both user ids and usernames; merge them in the admin UI, or pass
+`MERGE_DUPLICATES=1` to merge the newer user into the original with
+Discourse's `UserMerger`. Writes happen in one transaction.
+
+Do staging (Sepolia) first, then production (mainnet). Light Account
+addresses are the same on both chains; `RPC_URL` only feeds the contract
+wallet check and should point at the forum's chain.
+
+0. Find out whether the forum ever ran a build with the Light Account login
+   (`8a4f838` or later; check the plugin commit in the admin panel or in
+   `app.yml` and the rebuild history). If it did, users who signed in since
+   then are rows for `S` with no recorded owner, and an `S` missing from the
+   map would be rewritten to the Light Account of `S`. Set `SUSPECT_AFTER` to
+   that first deploy time (ISO 8601) in steps 3 and 5. If it never did, pass
+   `NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1` with `APPLY=1` instead; the script
+   refuses to apply with neither.
+
+1. Put the new plugin checkout where the container can read it, without
+   rebuilding yet:
+
+   ```bash
+   cd /var/discourse
+   git clone -b smart-account-login https://github.com/SocietyProtocol/discourse-siwe-auth.git \
+     shared/standalone/tmp/discourse-siwe-auth
+   ./launcher enter app
+   cd /var/www/discourse
+   ```
+
+2. Back up what the rewrite touches (needed for rollback):
+
+   ```bash
+   sudo -u postgres psql discourse -c "
+     CREATE TABLE siwe_backup_accounts AS
+       SELECT * FROM user_associated_accounts WHERE provider_name = 'siwe';
+     CREATE TABLE siwe_backup_fields AS
+       SELECT * FROM user_custom_fields
+       WHERE name IN ('wallet_address', 'siwe_owner_address');
+     CREATE TABLE siwe_backup_names AS
+       SELECT id, name FROM users
+       WHERE id IN (SELECT user_id FROM siwe_backup_accounts);"
+   ```
+
+   With `MERGE_DUPLICATES=1`, also take a full backup (`discourse backup`):
+   merges cannot be undone from these tables.
+
+3. Dry run, and read the table (`rewrite`, `duplicate`, `adopt`, `review`,
+   `contract`, ...):
+
+   ```bash
+   RPC_URL=https://ethereum-rpc.publicnode.com \
+   SUSPECT_AFTER=2026-10-15T16:00:00Z \
+     sudo -E -u discourse bundle exec rails runner \
+     /shared/tmp/discourse-siwe-auth/script/rewrite_smart_account_users.rb
+   ```
+
+   (`SUSPECT_AFTER` per step 0; the value above is an example.) No
+   `rewrite` row may have a `from` that is a known Light Account (the
+   script aborts if one does). Check every `review` row by hand: compare
+   its `from` with the map and the user's history before changing it.
+
+4. Turn off **Discourse siwe enabled**, so nobody signs in with the old page
+   between the rewrite and the rebuild.
+
+5. Apply (same command with `APPLY=1`, the same `SUSPECT_AFTER` or
+   `NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1`, plus `MERGE_DUPLICATES=1` if wanted).
+   Re-run the dry run: every row should now be `already`, apart from the
+   `review` rows you chose to leave.
+
+6. Deploy the plugin (new `siwe.iife.js`, strategy and lookups):
+   `./launcher rebuild app`. Turn **Discourse siwe enabled** back on and sign
+   in once with a migrated wallet: it must land on the existing user.
+
+Rollback (before any merge): turn off **Discourse siwe enabled**, restore the
+backup, then rebuild with the previous plugin commit.
+
+```bash
+sudo -u postgres psql discourse -c "
+  UPDATE user_associated_accounts a SET provider_uid = b.provider_uid, info = b.info
+    FROM siwe_backup_accounts b WHERE a.id = b.id;
+  DELETE FROM user_custom_fields WHERE name = 'siwe_owner_address'
+    AND id NOT IN (SELECT id FROM siwe_backup_fields);
+  UPDATE user_custom_fields f SET value = b.value
+    FROM siwe_backup_fields b WHERE f.id = b.id;
+  UPDATE users u SET name = b.name FROM siwe_backup_names b WHERE u.id = b.id;"
+```
+
+Users who signed in as `S` after the deploy and have no row in the backup keep
+their `S` account. Drop the `siwe_backup_*` tables once the switch is settled.
 
 ## Troubleshooting and engineering notes
 

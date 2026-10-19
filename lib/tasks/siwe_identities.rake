@@ -22,7 +22,9 @@ namespace :siwe do
         user.custom_fields['ens_name']   = ens_name   if ens_name
         user.custom_fields['ens_avatar'] = ens_avatar if ens_avatar
 
-        society = DiscourseSiwe::IdentityResolver.resolve(wallet)
+        society = DiscourseSiwe::IdentityResolver.resolve_with_owner(
+          wallet, user.custom_fields['siwe_owner_address'],
+        )
         DiscourseSiwe::IdentityStore.store_society(user, society)
         user.custom_fields['preferred_identity'] =
           DiscourseSiwe::IdentityStore.default_preference(user.custom_fields)
