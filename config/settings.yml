@@ -13,6 +13,9 @@ discourse_siwe:
     default: true
   siwe_society_subgraph_url:
     default: ''
+  siwe_society_subgraph_token:
+    default: ''
+    secret: true
   siwe_society_badges_contract:
     default: '0x2313C0cDdc233c92d16c2cfE17DF5fDCcE556763'
   siwe_identity_resolution_mode:
