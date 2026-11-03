@@ -6,5 +6,6 @@ en:
     siwe_statement: 'Statement that will be displayed in the SIWE message'
     siwe_society_enabled: 'Enable Society Protocol identity resolution and the display-identity toggle'
     siwe_society_subgraph_url: 'Society Protocol subgraph URL (optional; falls back to direct RPC if blank or failing)'
+    siwe_society_subgraph_token: 'Bearer token for the Society query gateway (GRAPH_QUERY_GATEWAY_TOKEN). Without it the gateway rejects lookups and profile names do not resolve.'
     siwe_society_badges_contract: 'Society Protocol Badges (ERC-1155) contract address'
     siwe_identity_resolution_mode: 'Preferred resolution mode for Society Protocol identities'
