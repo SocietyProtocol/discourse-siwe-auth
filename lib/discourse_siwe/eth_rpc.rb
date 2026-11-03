@@ -24,6 +24,93 @@ module DiscourseSiwe
       http
     end
 
+    # Raised by the strict helpers below. Unlike eth_call/get_code, which turn
+    # every failure into nil, these never let an RPC failure look like an
+    # answer. Messages never contain the URL (it carries the API key).
+    Error = Class.new(StandardError)
+
+    # RPC used for badge reads. A separate setting because staging reads
+    # Sepolia badges while SIWE verification stays on mainnet.
+    def badges_rpc_url
+      url = SiteSetting.siwe_society_badges_rpc_url.to_s.strip rescue ''
+      url.empty? ? rpc_url : url
+    end
+
+    # One JSON-RPC request. Returns the "result" member or raises Error.
+    def rpc_request(url, method, params, timeout: 10)
+      raise Error, 'RPC URL is not configured' if url.to_s.strip.empty?
+
+      uri = URI(url)
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = uri.scheme == 'https'
+      http.open_timeout = timeout
+      http.read_timeout = timeout
+
+      req = Net::HTTP::Post.new(uri.request_uri, 'Content-Type' => 'application/json')
+      req.body = { jsonrpc: '2.0', method: method, params: params, id: 1 }.to_json
+
+      response = http.request(req)
+      raise Error, "RPC HTTP #{response.code}" unless response.code == '200'
+
+      body = JSON.parse(response.body)
+      raise Error, "RPC error: #{body['error']['message'].to_s[0, 120]}" if body.is_a?(Hash) && body['error']
+      raise Error, 'RPC returned no result' unless body.is_a?(Hash) && body.key?('result')
+
+      body['result']
+    rescue Error
+      raise
+    rescue StandardError => e
+      raise Error, "RPC request failed (#{e.class})"
+    end
+
+    # eth_call that raises on any failure (including a revert). Returns the
+    # result hex without 0x ('' for an empty result).
+    def eth_call_strict(to, data, url:, block: 'latest')
+      result = rpc_request(url, 'eth_call', [{ to: to, data: data }, block])
+      raise Error, 'eth_call returned a non-string result' unless result.is_a?(String)
+
+      remove_hex_prefix(result)
+    end
+
+    def chain_id(url:)
+      result = rpc_request(url, 'eth_chainId', [])
+      raise Error, 'eth_chainId returned a non-string result' unless result.is_a?(String)
+
+      remove_hex_prefix(result).to_i(16)
+    end
+
+    # Code hex without 0x ('' for an EOA); raises when the RPC fails.
+    def get_code_strict(address, url:)
+      result = rpc_request(url, 'eth_getCode', [address, 'latest'])
+      raise Error, 'eth_getCode returned a non-string result' unless result.is_a?(String)
+
+      remove_hex_prefix(result)
+    end
+
+    # ABI tail of a dynamic uint256[]: length word, then the elements.
+    def encode_uint256_list(values)
+      encode_uint256(values.size) + values.map { |v| encode_uint256(v) }.join
+    end
+
+    # ABI tail of a dynamic address[].
+    def encode_address_list(addresses)
+      encode_uint256(addresses.size) + addresses.map { |a| encode_address(a) }.join
+    end
+
+    # Decodes a returned uint256[] (offset word, length word, elements).
+    # Raises Error on anything malformed or truncated instead of guessing.
+    def decode_uint256_list(hex)
+      hex = hex.to_s
+      raise Error, 'empty array result' if hex.length < 128
+
+      offset = hex[0, 64].to_i(16) * 2
+      length = hex[offset, 64].to_s.to_i(16)
+      start = offset + 64
+      raise Error, 'truncated array result' if hex.length < start + length * 64
+
+      Array.new(length) { |i| hex[start + i * 64, 64].to_i(16) }
+    end
+
     # Generic eth_call. Returns hex result without 0x prefix, or nil.
     # `to` may be nil for contract-creation simulation (used by EIP-6492).
     def eth_call(to, data, http: nil)
