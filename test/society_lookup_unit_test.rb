@@ -172,8 +172,18 @@ end
 class StoreSocietyTest < Minitest::Test
   FAILED = DiscourseSiwe::IdentityResolver::LOOKUP_FAILED
 
+  # A plain class rather than Struct: Ruby 3.2+ treats a trailing hash passed
+  # to Struct.new as keywords, which broke this stub on the forum's Ruby 3.4.
+  FakeUser = Class.new do
+    attr_reader :custom_fields
+
+    def initialize(fields)
+      @custom_fields = fields
+    end
+  end
+
   def user
-    Struct.new(:custom_fields).new(
+    FakeUser.new(
       'society_badge_id' => '42', 'society_name' => 'Ada', 'society_avatar' => 'https://a/b.png',
       'society_bio' => 'hi', 'society_resolved_at' => '2026-01-01T00:00:00Z',
     )
