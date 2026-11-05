@@ -8,12 +8,15 @@ module DiscourseSiwe
   # BadgeMirror, BadgeCatalog and BadgeContent; this file only adapts.
   #
   # Discourse APIs used (checked against 2026.8.0):
-  #   BadgeGranter.grant(badge, user, granted_by:, suppress_notification:)
+  #   BadgeGranter.grant(badge, user, granted_by:)   (no suppress option exists in 2026.8.0: silence
+  #     goes through the :badge_granter_suppress_notification modifier registered in plugin.rb,
+  #     switched on only around one grant by with_suppressed)
   #   BadgeGranter.revoke(user_badge, revoked_by: optional)
   #   FileHelper.download(url, max_file_size:, tmp_file_name:, ...)  (SSRF guarded)
   #   UploadCreator.new(file, filename, type: 'badge_image').create_for(user_id)
   module BadgeMirrorRunner
     STORE = 'discourse-siwe-auth'
+    SUPPRESS_KEY = :siwe_badge_mirror_suppress_badge_id
     RECORD_PREFIX = 'badge_mirror:token:'
     META_KEY = 'badge_mirror_meta'
     PENDING_KEY = 'badge_mirror_pending'
@@ -25,6 +28,19 @@ module DiscourseSiwe
     FORCE_FLOOR = 1_000_000_000
 
     module_function
+
+    # True only while with_suppressed is running for this very badge.
+    def suppressing?(badge)
+      badge && Thread.current[SUPPRESS_KEY] == badge.id
+    end
+
+    def with_suppressed(badge_id)
+      previous = Thread.current[SUPPRESS_KEY]
+      Thread.current[SUPPRESS_KEY] = badge_id
+      yield
+    ensure
+      Thread.current[SUPPRESS_KEY] = previous
+    end
 
     def config(force: false)
       allowlist = SiteSetting.siwe_badges_community_allowlist.to_s.split('|').map { |v| BadgeContent.token_id(v) }.compact
@@ -293,7 +309,12 @@ module DiscourseSiwe
         return false unless badge && user
 
         existed = UserBadge.exists?(badge_id: badge_id, user_id: user_id)
-        user_badge = BadgeGranter.grant(badge, user, granted_by: Discourse.system_user, suppress_notification: suppress)
+        user_badge =
+          if suppress
+            BadgeMirrorRunner.with_suppressed(badge.id) { BadgeGranter.grant(badge, user, granted_by: Discourse.system_user) }
+          else
+            BadgeGranter.grant(badge, user, granted_by: Discourse.system_user)
+          end
         audit('granted', user, badge) if user_badge && !existed
         !!user_badge
       rescue ActiveRecord::RecordNotUnique, ActiveRecord::RecordInvalid

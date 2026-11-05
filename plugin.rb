@@ -235,6 +235,12 @@ auth_provider authenticator: ::SiweAuthenticator.new,
               title_setting: :siwe_statement,
               full_screen_login: true
 
+# Backfilled badge grants must not notify anyone. BadgeGranter.grant has no
+# per-call switch, so the mirror turns this modifier on around one grant.
+register_modifier(:badge_granter_suppress_notification) do |suppress, badge, _granted_at, _skip_new_user_tips|
+  suppress || (defined?(DiscourseSiwe::BadgeMirrorRunner) && DiscourseSiwe::BadgeMirrorRunner.suppressing?(badge))
+end
+
 after_initialize do
   load File.expand_path('../lib/discourse_siwe/eth_rpc.rb', __FILE__)
   load File.expand_path('../lib/discourse_siwe/light_account.rb', __FILE__)
