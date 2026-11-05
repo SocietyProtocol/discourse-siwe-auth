@@ -2,7 +2,7 @@
 
 # name: Web3 Outpost sign-in for Discourse
 # about: Sign in with Ethereum and display your web3 identity (wallet, ENS, or Society Protocol outpost) in Discourse. Forked and extended from signinwithethereum/discourse-siwe-auth by Society Protocol.
-# version: 1.6.0
+# version: 1.7.0
 # authors: Society Protocol
 # url: https://github.com/SocietyProtocol/discourse-siwe-auth
 
@@ -236,6 +236,10 @@ after_initialize do
   load File.expand_path('../lib/discourse_siwe/group_sync_planner.rb', __FILE__)
   load File.expand_path('../lib/discourse_siwe/badge_group_sync.rb', __FILE__)
   load File.expand_path('../lib/discourse_siwe/group_sync_runner.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/gating_config.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/gating_planner.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/gating_audit.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/gating_runner.rb', __FILE__)
   load File.expand_path('../app/controllers/discourse_siwe/auth_controller.rb', __FILE__)
   load File.expand_path('../app/jobs/regular/refresh_siwe_identity.rb', __FILE__)
   load File.expand_path('../app/jobs/regular/sync_siwe_user_groups.rb', __FILE__)

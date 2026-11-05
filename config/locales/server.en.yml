@@ -16,4 +16,5 @@ en:
     siwe_group_sync_removal_floor: 'Brake: never remove more than this many members from one group in a single run (or the percentage below, whichever is larger). When exceeded, nobody is removed from that group.'
     siwe_group_sync_removal_percent: 'Brake: percentage of a group that may be removed in a single run.'
     siwe_group_sync_removal_confirmations: 'A member must be seen without the badge this many runs in a row before removal.'
+    siwe_gating_config: 'YAML describing the gated groups and which categories they can see (see the README, Token-gated categories). Applied with the rake task siwe:gating:provision; nothing happens when it changes. Kept in the database, not in the public repo.'
     siwe_identity_resolution_mode: 'Preferred resolution mode for Society Protocol identities'

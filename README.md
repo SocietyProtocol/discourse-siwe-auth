@@ -134,6 +134,37 @@ WalletConnect / Reown project ID. Without a project ID, only injected wallets
 | **Siwe society subgraph token** | _Secret._ Bearer token for the query gateway (`GRAPH_QUERY_GATEWAY_TOKEN`). The gateway rejects requests without it, so profile names do not resolve while this is empty. Set via the `DISCOURSE_SIWE_SOCIETY_SUBGRAPH_TOKEN` env var or the admin UI. |
 | **Siwe identity resolution mode** | Preferred resolution mode: `subgraph` (default, falls back to RPC) or `rpc` (direct contract calls only). |
 
+## Token-gated categories
+
+Groups that follow badge holders are described in [Groups follow badges](#configuration) (`siwe_group_badge_mapping`). Token-gated **categories** add the missing half: which groups can see which categories. It is configuration, applied by a rake task, never by a background job.
+
+Put the YAML in the `siwe_gating_config` site setting (it lives in the database, so the production layout is not in this public repo), or point `SIWE_GATING_FILE` at a file for one run.
+
+```yaml
+groups:
+  vip-gold:
+    full_name: VIP Gold          # optional
+    visibility: members          # members (default) | staff | owners
+  governors: {}
+categories:
+  gold-lounge:                   # category slug
+    name: Gold Lounge            # used only if the category is created
+    parent: community            # optional parent slug
+    confirm_restrict: true       # needed to restrict a category that is public today
+    access:                      # group: full | reply | read
+      vip-gold: full
+      governors: read            # higher tiers: just list several groups
+```
+
+* `siwe:gating:provision` shows the plan. `siwe:gating:provision[apply]` applies it. It is idempotent: a second run changes nothing.
+* It only touches the groups and categories named in the YAML, and only a category's permissions (never its name, description, topics or order). Staff always keep full access. `everyone` is never listed: a gated category is gated by leaving it out.
+* New groups are closed (no public join, no requests). Automatic groups (`admins`, `moderators`, `staff`, `trust_level_*`) are refused.
+* Restricting a category that is public today is **blocked** until `confirm_restrict: true` is set, so it cannot happen by accident.
+* `siwe:gating:status` shows drift between the YAML and the forum and what the badge sync would add or remove.
+* `siwe:gating:audit` is the mandatory check before restricting anything. It lists members of a gated group who hold no badge (they would lose access), members with no wallet (they would keep access forever), and gated groups no badge feeds. It exits non-zero until each item is resolved: remove them, grandfather them with `siwe_group_sync_exempt_usernames`, or give them the badge.
+* If Fritz edits a gated category's permissions in the admin UI, `status` reports it as drift and `provision[apply]` puts it back. The YAML wins.
+* Group lists and flair reveal who holds a badge by wallet. Choose each group's `visibility` accordingly.
+
 ## Compatibility notes (Discourse + Ruby 3.4)
 
 Recent versions of Discourse ship Ruby 3.4 inside the official
