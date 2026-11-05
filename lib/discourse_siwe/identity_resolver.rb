@@ -17,8 +17,13 @@ module DiscourseSiwe
       EthRpc.keccak256('profileBadgeId(address)')[0, 4]
     ).freeze
 
+    # The production query gateway only runs persisted documents, matched by
+    # operation name and by the exact canonical text. This is the registered
+    # `User` document (web3-app-subgraph infra/query-gateway/generated/
+    # registry.js); change it only together with the registry.
+    USER_OPERATION = 'User'
     USER_QUERY = <<~GRAPHQL
-      query GetUser($id: ID!) {
+      query User($id: ID!) {
         user(id: $id) {
           id
           name
@@ -29,16 +34,91 @@ module DiscourseSiwe
             bio
             imageUrl
           }
+          communities(first: 1000) {
+            id
+          }
           profile {
+            id
+          }
+          invitedBy {
+            id
+            name
+            bio
+            imageUrl
+            metadata {
+              name
+              bio
+              imageUrl
+            }
+          }
+          badges(first: 1000, where: {isProfile: false}) {
             id
             name
             description
-            imageUrl
+            isOfficial
+            isCommunity
             uri
+            hookAddress
+            imageUrl
+            metadata {
+              description
+              imageUrl
+            }
+            creatorAddress
+            createdAt
+            holdersCount
+            community {
+              id
+              name
+            }
+            createdBy {
+              id
+              name
+              bio
+              imageUrl
+              metadata {
+                name
+                bio
+                imageUrl
+              }
+            }
+          }
+          managedBadges(first: 1000, where: {isProfile: false}) {
+            id
+            name
+            description
+            isOfficial
+            isCommunity
+            uri
+            hookAddress
+            imageUrl
+            metadata {
+              description
+              imageUrl
+            }
+            creatorAddress
+            createdAt
+            holdersCount
+            createdBy {
+              id
+              name
+              bio
+              imageUrl
+              metadata {
+                name
+                bio
+                imageUrl
+              }
+            }
           }
         }
       }
     GRAPHQL
+
+    # Returned instead of nil when a lookup could not be completed (network
+    # error, gateway rejection, bad response). nil means "looked it up and
+    # there is no profile"; this means "unknown, change nothing".
+    LOOKUP_FAILED = :lookup_failed
     FILEBASE_GATEWAY = 'https://ipfs.filebase.io/ipfs/'
 
     def self.resolve(wallet_address)
@@ -47,17 +127,24 @@ module DiscourseSiwe
 
     # The forum address is the member's Light Account, whose Society profile
     # may not exist yet. Fall back to the owner EOA's profile in that case.
+    #
+    # Returns a profile hash, nil when there is no profile, or LOOKUP_FAILED
+    # when the answer is unknown (callers must then keep what they have).
     def self.resolve_with_owner(wallet_address, owner_address)
       society = resolve(wallet_address)
       return society if profile?(society)
       return society if owner_address.to_s.strip.empty?
       return society if owner_address.to_s.downcase == wallet_address.to_s.downcase
 
-      resolve(owner_address) || society
+      from_owner = resolve(owner_address)
+      return from_owner if profile?(from_owner)
+
+      # No profile on either address; if either lookup failed we cannot say so.
+      [society, from_owner].include?(LOOKUP_FAILED) ? LOOKUP_FAILED : nil
     end
 
     def self.profile?(society)
-      return false unless society
+      return false unless society.is_a?(Hash)
 
       !society[:badge_id].to_s.strip.empty? || !society[:name].to_s.strip.empty?
     end
@@ -66,14 +153,19 @@ module DiscourseSiwe
       @wallet_address = wallet_address.to_s.downcase
     end
 
-    # Returns { badge_id:, name:, bio:, avatar:, uri: } or nil.
+    # Returns { badge_id:, name:, bio:, avatar:, uri: }, nil when the address
+    # has no Society profile, or LOOKUP_FAILED when it could not be determined.
     def resolve
       return nil unless SiteSetting.siwe_society_enabled
       return nil unless @wallet_address.match?(/\A0x[0-9a-fA-F]{40}\z/)
 
       if SiteSetting.siwe_identity_resolution_mode == 'subgraph' &&
          !SiteSetting.siwe_society_subgraph_url.to_s.strip.empty?
-        via_subgraph || via_rpc
+        subgraph = via_subgraph
+        return subgraph if subgraph.is_a?(Hash) || subgraph.nil?
+
+        # Subgraph failed: try the chain, but keep "unknown" if that is empty.
+        via_rpc || LOOKUP_FAILED
       else
         via_rpc
       end
@@ -81,6 +173,7 @@ module DiscourseSiwe
 
     private
 
+    # Hash (profile), nil (no such user / no profile), or LOOKUP_FAILED.
     def via_subgraph
       uri = URI(SiteSetting.siwe_society_subgraph_url)
       http = Net::HTTP.new(uri.host, uri.port)
@@ -88,33 +181,52 @@ module DiscourseSiwe
       http.open_timeout = 10
       http.read_timeout = 10
 
-      req = Net::HTTP::Post.new(
-        uri.path.empty? ? '/' : uri.path,
-        'Content-Type' => 'application/json'
-      )
-      req.body = { query: USER_QUERY, variables: { id: @wallet_address } }.to_json
+      headers = { 'Content-Type' => 'application/json' }
+      token = subgraph_token
+      headers['Authorization'] = "Bearer #{token}" unless token.empty?
 
-      data = JSON.parse(http.request(req).body).dig('data', 'user')
+      req = Net::HTTP::Post.new(uri.path.empty? ? '/' : uri.path, headers)
+      req.body = {
+        query: USER_QUERY,
+        operationName: USER_OPERATION,
+        variables: { id: @wallet_address },
+      }.to_json
+
+      response = http.request(req)
+      unless response.code.to_i == 200
+        log_warn("[discourse-siwe-auth] Society subgraph HTTP #{response.code}")
+        return LOOKUP_FAILED
+      end
+
+      body = JSON.parse(response.body)
+      if body['errors'].is_a?(Array) && !body['errors'].empty?
+        log_warn("[discourse-siwe-auth] Society subgraph error: #{body['errors'].first.inspect}")
+        return LOOKUP_FAILED
+      end
+      return LOOKUP_FAILED unless body.is_a?(Hash) && body.key?('data')
+
+      data = body.dig('data', 'user')
       return nil unless data
 
       profile = data['profile'] || {}
       metadata = data['metadata'] || {}
       {
         badge_id: profile['id'],
-        name:   first_non_empty(data['name'], metadata['name'], profile['name']),
-        bio:    first_non_empty(data['bio'], metadata['bio'], profile['description']),
+        name:   first_non_empty(data['name'], metadata['name']),
+        bio:    first_non_empty(data['bio'], metadata['bio']),
         avatar: normalize_url(
-          first_non_empty(
-            data['imageUrl'],
-            metadata['imageUrl'],
-            profile['imageUrl'],
-          )
+          first_non_empty(data['imageUrl'], metadata['imageUrl'])
         ),
-        uri:    profile['uri'],
+        uri:    nil,
       }
     rescue StandardError => e
       log_warn("[discourse-siwe-auth] Society subgraph error: #{e.message}")
-      nil
+      LOOKUP_FAILED
+    end
+
+    def subgraph_token
+      value = SiteSetting.respond_to?(:siwe_society_subgraph_token) ? SiteSetting.siwe_society_subgraph_token : ''
+      value.to_s.strip
     end
 
     def via_rpc
@@ -162,7 +274,7 @@ module DiscourseSiwe
       end
     rescue StandardError => e
       log_warn("[discourse-siwe-auth] Society RPC resolution error: #{e.message}")
-      nil
+      LOOKUP_FAILED
     end
 
     def fetch_metadata(metadata_uri)
