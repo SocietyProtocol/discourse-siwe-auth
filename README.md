@@ -524,14 +524,25 @@ Everything ships **off** (`siwe_badges_sync_mode` = `off`).
   "unknown" and never revokes.
 * **Scope:** official badges, plus the community badge token ids in
   `siwe_badges_community_allowlist`. Community names, descriptions and images
-  are chosen by their creators: text is reduced to plain text (no HTML,
-  markdown or links) and length capped (name 50, description 500, long
-  description 1000); images must be https (IPFS forms are rewritten to one
+  are chosen by their creators: the input is cut to 4096 characters first,
+  HTML entities are decoded to a fixed point (so a double-encoded tag cannot
+  survive), and the text is reduced to plain text: no HTML, markdown, links or
+  e-mail addresses, Unicode NFKC, every invisible, bidi, control and format
+  character removed by category, every kind of space collapsed, `%` and `&`
+  neutralised (Discourse interpolates `%{...}` in descriptions and unescapes
+  entities after sanitising). Lengths are capped (name 50, description 500,
+  long description 1000). The long description is sanitised HTML (that is how
+  Discourse renders it) whose only link is ours, built from
+  `siwe_badges_app_url` after validation (https, plain host, no userinfo,
+  query or fragment). Images must be https (IPFS forms are rewritten to one
   gateway), at most 2 MB, and actually a PNG, JPEG, GIF, WebP or SVG;
   downloads go through `FileHelper.download`, which refuses private and
-  loopback addresses and re-checks redirects.
+  loopback addresses and re-checks redirects. A whole download is cut off
+  after 25 seconds, and a source that failed is not tried again for 24 hours
+  (unless the badge points at another URL).
 * **Names:** Discourse badge names are unique and double as translation keys.
-  A name that is taken (case and spaces ignored) gets the suffix ` (#<token id>)`.
+  A name that is taken (case, spaces, invisible characters and Unicode
+  compatibility forms ignored) gets the suffix ` (#<token id>)`.
   A chosen name is kept until the chain name really changes.
 * **State:** the badge-to-token mapping lives in the plugin store (key
   `badge_mirror:token:<id>`: badge id, uri, image source and hash, upload id,
@@ -540,7 +551,11 @@ Everything ships **off** (`siwe_badges_sync_mode` = `off`).
   community badges Silver (constants in `badge_catalog.rb`).
 * **Duplicates:** accounts that share any address (the Light Account rewrite
   can leave duplicates) are one person; the lowest user id keeps the badges.
-  This does not depend on which address is the account's wallet today.
+  This does not depend on which address is the account's wallet today. The
+  person is judged by the holdings of ALL the group's addresses, so a badge
+  that sits only on a duplicate's Light Account still counts, even when the
+  address map is missing or stale. A duplicate's badge is never revoked on an
+  unreadable balance.
 * **Who is evaluated:** active, not staged, not anonymous, not suspended, not
   silenced, with a wallet on record. Everyone else is left exactly as is.
 
@@ -554,10 +569,15 @@ Everything ships **off** (`siwe_badges_sync_mode` = `off`).
   runs in a row (default 2, so about two hours) before it is revoked.
 * Brake: more than `max(siwe_badges_revoke_floor, siwe_badges_revoke_percent
   of current grants)` revokes in one run revokes nobody, per badge and across
-  the whole run. A brake, or a blocked run, puts revokes on hold: the
-  per-login job will not revoke until a clean full run clears the hold.
+  the whole run. A brake, or a blocked run, raises a revoke hold, shown in
+  the report and cleared by the next clean full run.
   After checking the report, `rake 'siwe:badges:sync[enforce,force]'` skips
   the counters and the brakes once.
+* Only the hourly full run revokes. The per-login job is add-only: it never
+  revokes and never reads, advances or writes the counters or the hold, so it
+  cannot race the full run or confirm an absence on its own.
+* A badge whose Badge row was deleted is rebuilt as a fresh badge: its first
+  pass over the holders is silent again (no notification for every holder).
 * Mode `log` reads and reports; it writes no badge, grant, upload, setting or
   counter. Only the report is stored.
 
@@ -570,17 +590,18 @@ Everything ships **off** (`siwe_badges_sync_mode` = `off`).
 | `siwe_badges_revoke_floor`, `siwe_badges_revoke_percent` | The revoke brake (5 and 20 by default). |
 | `siwe_badges_revoke_confirmations` | Runs in a row before a revoke or an archive (2). |
 | `siwe_badges_notify_on_grant` | Notify members of new grants (true). The first pass over each badge is always silent. |
-| `siwe_badges_app_url` | Base URL of the Society app for the link on each badge page (blank: no link). |
+| `siwe_badges_app_url` | Base URL of the Society app for the link on each badge page (blank: no link). Used only when it is an https URL with a plain host, no userinfo, query, fragment or special characters; anything else means no link. |
 | `siwe_badges_disable_system` | Keep Discourse's built-in badges disabled (see below). |
 
 ### Triggers
 
 * An hourly scheduled job (`Jobs::SiweBadgeMirror`) does the full reconcile
   under a `DistributedMutex`. Only it archives badges and decides revokes for
-  everyone.
+  everyone (after `siwe_badges_revoke_confirmations` runs in a row).
 * A per-login job (`Jobs::SyncSiweUserBadges`, enqueued from
   `after_authenticate` and `after_create_account`, never calling the network
-  inline) reconciles that member only, at most once an hour, in `enforce` mode.
+  inline) grants that member what they hold, add-only, at most once an hour,
+  in `enforce` mode.
 
 ### Rake tasks
 
