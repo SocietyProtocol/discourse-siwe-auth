@@ -2,7 +2,7 @@
 
 # name: Web3 Outpost sign-in for Discourse
 # about: Sign in with Ethereum and display your web3 identity (wallet, ENS, or Society Protocol outpost) in Discourse. Forked and extended from signinwithethereum/discourse-siwe-auth by Society Protocol.
-# version: 1.5.0
+# version: 1.6.0
 # authors: Society Protocol
 # url: https://github.com/SocietyProtocol/discourse-siwe-auth
 
@@ -141,6 +141,7 @@ class ::SiweAuthenticator < ::Auth::ManagedAuthenticator
       if SiteSetting.siwe_society_enabled && DiscourseSiwe::IdentityStore.society_stale?(result.user)
         Jobs.enqueue(:refresh_siwe_identity, user_id: result.user.id)
       end
+      enqueue_group_sync(result.user)
     else
       result.extra_data = (result.extra_data || {}).merge(
         wallet_address: wallet,
@@ -157,10 +158,21 @@ class ::SiweAuthenticator < ::Auth::ManagedAuthenticator
 
   def after_create_account(user, auth_result)
     super
-    return unless SiteSetting.siwe_society_enabled
-
     extra = auth_result[:extra_data] || {}
     wallet = extra['wallet_address'] || extra[:wallet_address]
+
+    # Group sync does not depend on Society identity resolution, so it is
+    # enqueued before the siwe_society_enabled early return. The wallet is
+    # stored first because the job reads it.
+    if wallet.present?
+      user.custom_fields['wallet_address'] = wallet.downcase
+      owner_address = extra['owner_address'] || extra[:owner_address]
+      user.custom_fields['siwe_owner_address'] = owner_address if owner_address.present?
+      user.save_custom_fields
+      enqueue_group_sync(user)
+    end
+
+    return unless SiteSetting.siwe_society_enabled
     return unless wallet.present?
 
     user.custom_fields['wallet_address'] = wallet.downcase
@@ -180,6 +192,16 @@ class ::SiweAuthenticator < ::Auth::ManagedAuthenticator
   end
 
   private
+
+  # Grants group access shortly after a login; removals are left to the
+  # scheduled reconcile. Never allowed to break a login.
+  def enqueue_group_sync(user)
+    return unless %w[log enforce].include?(SiteSetting.siwe_group_sync_mode)
+
+    Jobs.enqueue(:sync_siwe_user_groups, user_id: user.id)
+  rescue StandardError => e
+    Rails.logger.warn("[discourse-siwe-auth] could not enqueue group sync: #{e.class}")
+  end
 
   # Discourse looks up provider_uid exactly and uid is now always EIP-55
   # checksummed. Adopt a single legacy row stored in another case (e.g. a
@@ -208,8 +230,16 @@ after_initialize do
   load File.expand_path('../lib/discourse_siwe/identity_resolver.rb', __FILE__)
   load File.expand_path('../lib/discourse_siwe/identity_store.rb', __FILE__)
   load File.expand_path('../lib/discourse_siwe/display_name_applier.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/member_addresses.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/badge_group_mapping.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/badge_ownership.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/group_sync_planner.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/badge_group_sync.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/group_sync_runner.rb', __FILE__)
   load File.expand_path('../app/controllers/discourse_siwe/auth_controller.rb', __FILE__)
   load File.expand_path('../app/jobs/regular/refresh_siwe_identity.rb', __FILE__)
+  load File.expand_path('../app/jobs/regular/sync_siwe_user_groups.rb', __FILE__)
+  load File.expand_path('../app/jobs/scheduled/siwe_group_sync.rb', __FILE__)
 
   DiscourseSiwe::IdentityStore::FIELDS.each do |field|
     User.register_custom_field_type(field, :string)

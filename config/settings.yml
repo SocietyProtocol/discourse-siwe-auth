@@ -13,8 +13,40 @@ discourse_siwe:
     default: true
   siwe_society_subgraph_url:
     default: ''
+  siwe_society_subgraph_token:
+    default: ''
+    secret: true
   siwe_society_badges_contract:
     default: '0x2313C0cDdc233c92d16c2cfE17DF5fDCcE556763'
+  siwe_society_badges_rpc_url:
+    default: ''
+    secret: true
+  siwe_society_badges_chain_id:
+    default: 0
+    min: 0
+  siwe_group_sync_mode:
+    default: 'off'
+    type: enum
+    choices:
+      - 'off'
+      - log
+      - enforce
+  siwe_group_badge_mapping:
+    default: ''
+  siwe_group_sync_exempt_usernames:
+    type: list
+    default: ''
+  siwe_group_sync_removal_floor:
+    default: 3
+    min: 0
+  siwe_group_sync_removal_percent:
+    default: 20
+    min: 0
+    max: 100
+  siwe_group_sync_removal_confirmations:
+    default: 2
+    min: 1
+    max: 10
   siwe_identity_resolution_mode:
     default: 'subgraph'
     type: enum
