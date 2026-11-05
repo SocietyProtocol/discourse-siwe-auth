@@ -20,13 +20,35 @@ module DiscourseSiwe
 
     IPFS_GATEWAY = 'https://ipfs.filebase.io/ipfs/'
     URL_MAX = 2048
+    APP_URL_MAX = 200
+    BREAK = '<br><br>'
     IMAGE_TYPES = %i[png jpeg gif webp svg].freeze
     IMAGE_MAX_BYTES = 2 * 1024 * 1024
 
     CID = /\A(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{58,})\z/
-    # Zero width, bidi override and BOM characters: used to spoof names.
-    INVISIBLE = /[​-‏‪-‮⁠-⁩﻿]/
-    CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u2028\u2029]/
+    # Chain text is cut to this many characters before any pattern runs, and
+    # again after every normalisation step (NFKC can expand a character), so
+    # no regex ever sees more than this much hostile input.
+    INPUT_MAX = 4096
+    DECODE_PASSES = 5
+
+    # Whitespace-like separators (category Zs, tab, form feed...) become a
+    # plain space; line separators become a newline.
+    SPACES = /[\p{Zs}\t\v\f]/
+    LINE_BREAKS = /[\u0085\u2028\u2029\r]/
+    # Controls other than the newline.
+    CONTROLS = /(?!\n)\p{Cc}/
+    # Removed without a trace: format characters (zero width, bidi, soft
+    # hyphen, Arabic letter mark, BOM, tag characters...), variation selectors,
+    # private use and surrogates, the combining grapheme joiner and the fillers
+    # and blanks that render as nothing (Hangul fillers, Khmer inherent
+    # vowels, braille blank).
+    INVISIBLE = /[\p{Cf}\p{Co}\p{Cs}\u{E0000}-\u{E007F}\uFE00-\uFE0F\u{E0100}-\u{E01EF}\u034F\u115F\u1160\u17B4\u17B5\u3164\uFFA0\u2800]/
+
+    # The fullwidth ampersand stands in for every '&': Discourse unescapes
+    # HTML entities in a description AFTER sanitising it, so a surviving
+    # entity (even a legacy one without ';') would become markup.
+    AMPERSAND = "\uFF06"
 
     module_function
 
@@ -38,29 +60,85 @@ module DiscourseSiwe
 
     # Reduces chain text to plain text: no HTML, no markdown, no links, no
     # invisible characters, single spaces. Returns '' for blank input.
+    #
+    # Order matters. Entities are decoded to a fixed point (with NFKC, so
+    # fullwidth forms cannot hide a tag or an entity) BEFORE anything is
+    # stripped, and the invisible-character removal runs on the final text, so
+    # nothing an entity decodes into survives. Every pattern is linear on the
+    # (length capped) input.
     def plain_text(value, max)
-      text = value.to_s.dup.force_encoding(Encoding::UTF_8).scrub('')
-      text = text.gsub(INVISIBLE, '').gsub(CONTROL, ' ')
+      text = decode(value)
       text = text.gsub(%r{<!--.*?-->}m, ' ')
       text = text.gsub(%r{<(script|style)\b.*?</\1\s*>}mi, ' ')
       text = text.gsub(%r{</?(?:p|br|div|li|ul|ol|h[1-6]|tr|td|table|blockquote)\b[^>]*>}i, ' ')
       text = text.gsub(/<[^>]*>/m, '')
-      text = CGI.unescapeHTML(text)
-      text = text.gsub(/[<>]/, ' ')                             # anything an entity decoded into a tag
+      text = text.gsub(/[<>]/, ' ')
       text = text.gsub(/!\[[^\]]*\]\([^)]*\)/, ' ')              # markdown images
       text = text.gsub(/\[([^\]]*)\]\([^)]*\)/, '\1')            # markdown links keep their label
       text = text.gsub(/\[([^\]]*)\]\[[^\]]*\]/, '\1')           # reference links
-      text = text.gsub(%r{\b(?:https?|ftp|ipfs)://\S+}i, ' ')    # bare URLs
-      text = text.gsub(/\bwww\.\S+/i, ' ')
-      text = text.gsub(/\b\S+@\S+\.\S+\b/, ' ')                  # emails
+      text = drop_links(text)
       text = text.gsub(/^[ \t]*(?:\#{1,6}|[>*+-]|\d+\.)[ \t]+/, '') # heading, quote and list markers
       text = text.gsub(/[`*~|\[\]]/, '')                         # emphasis, code, table, leftover brackets
+      text = text.gsub('%', ' percent ')                         # I18n would interpolate '%{...}' in a description
+      text = text.gsub('&', AMPERSAND)
       text = text.gsub(/\s+/, ' ').strip
       truncate(text, max)
     end
 
+    # Input -> a valid UTF-8 string of at most INPUT_MAX characters whose HTML
+    # entities are decoded to a fixed point (at most DECODE_PASSES passes; an
+    # entity that is still left is neutralised by the '&' replacement).
+    def decode(value)
+      text = cut(value.to_s.byteslice(0, INPUT_MAX * 4).to_s)
+      DECODE_PASSES.times do
+        decoded = cut(clean_characters(normalize(unescape(text))))
+        break if decoded == text
+
+        text = decoded
+      end
+      text
+    end
+
+    def cut(text)
+      text.dup.force_encoding(Encoding::UTF_8).scrub('')[0, INPUT_MAX]
+    end
+
+    def normalize(text)
+      text.unicode_normalize(:nfkc)
+    rescue ArgumentError, Encoding::CompatibilityError
+      text
+    end
+
+    def unescape(text)
+      CGI.unescapeHTML(text.gsub(/&nbsp;/i, ' ')).scrub('')
+    rescue ArgumentError, RangeError
+      text.gsub('&', ' ')
+    end
+
+    # Spaces, line breaks, controls and invisible characters.
+    def clean_characters(text)
+      text.gsub(INVISIBLE, '').gsub(SPACES, ' ').gsub(LINE_BREAKS, "\n").gsub(CONTROLS, ' ')
+    end
+
+    # URLs, www. hosts and e-mail addresses. Token based so that no pattern
+    # backtracks across the whole input.
+    def drop_links(text)
+      text = text.gsub(%r{\b(?:https?|ftp|ipfs)://\S+}i, ' ')
+      text = text.gsub(/\bwww\.\S+/i, ' ')
+      text.gsub(/\S+/) { |token| email_like?(token) ? ' ' : token }
+    end
+
+    def email_like?(token)
+      at = token.index('@')
+      return false unless at && at.positive?
+
+      dot = token.index('.', at + 2)
+      !dot.nil? && dot < token.length - 1
+    end
+
     def truncate(text, max)
       return text if text.length <= max
+      return '' if max < 2
 
       "#{text[0, max - 1].rstrip}…"
     end
@@ -71,10 +149,15 @@ module DiscourseSiwe
       cleaned.empty? ? nil : cleaned
     end
 
-    # The key Discourse resolves names by: Badge.i18n_name (also used for
-    # translation lookups, so "welcome" would pick up the system badge text).
+    # The key names are compared by: Discourse resolves a name through
+    # Badge.i18n_name (downcase, spaces to underscores) and also uses it for
+    # translation lookups, so "welcome" would pick up the system badge text.
+    # Ours is stricter: NFKC, case folding, invisible characters dropped and
+    # every kind of space collapsed, so a lookalike never counts as free.
     def name_key(value)
-      value.to_s.downcase.tr(' ', '_')
+      text = normalize(value.to_s.dup.force_encoding(Encoding::UTF_8).scrub('')[0, INPUT_MAX])
+      text = text.gsub(INVISIBLE, '').gsub(SPACES, ' ').gsub(/\s+/, ' ').strip
+      text.downcase(:fold).tr(' ', '_')
     end
 
     def suffix(token_id)
@@ -141,16 +224,38 @@ module DiscourseSiwe
       IMAGE_TYPES.include?(type)
     end
 
-    # Plain text for a badge's long description. The app link is ours (built
-    # from a setting), never chain content.
+    # HTML, because Discourse renders a long description as sanitised HTML
+    # (the badge card shows it through its sanitizer, no markdown step). Every
+    # piece is plain text (no '<', '>' or '&'), and the one link is ours, built
+    # from a validated setting and escaped. The link goes last and the text is
+    # cut to leave room for it, so truncation never splits the markup.
     def long_description(description, token_id, app_url: '')
-      link = app_url.to_s.strip.sub(%r{/+\z}, '')
-      parts = []
-      parts << description unless description.to_s.empty?
-      parts << "Mirrored from the Society Protocol outpost (token ##{token_id}) and granted automatically to " \
+      notice = "Mirrored from the Society Protocol outpost (token ##{token_id.to_i}) and granted automatically to " \
                'forum members whose linked wallet holds it. Edits made here are overwritten.'
-      parts << "[View this badge in the outpost](#{link}/badges/#{token_id})" if link.match?(%r{\Ahttps://[^\s)]+\z})
-      truncate(parts.join("\n\n"), LONG_DESCRIPTION_MAX)
+      base = app_url(app_url)
+      anchor = base.empty? ? '' : %(<a href="#{CGI.escapeHTML("#{base}/badges/#{token_id.to_i}")}">View this badge in the outpost</a>)
+
+      fixed = [notice, anchor].reject(&:empty?)
+      room = LONG_DESCRIPTION_MAX - fixed.sum(&:length) - (fixed.size * BREAK.length)
+      text = room >= 20 ? plain_text(description, [DESCRIPTION_MAX, room].min) : ''
+      ([text] + fixed).reject(&:empty?).join(BREAK)
+    end
+
+    # The siwe_badges_app_url setting, trusted for nothing: https, a plain host
+    # (letters, digits, dots, hyphens), optional port, no userinfo, query or
+    # fragment, no characters that I18n or HTML treat specially. => the URL
+    # without a trailing slash, or '' when it is not usable.
+    def app_url(value)
+      text = value.to_s.strip.sub(%r{/+\z}, '')
+      return '' if text.empty? || text.length > APP_URL_MAX || text.match?(/[^\x21-\x7E]/) || text.match?(/[%"'<>&\\{}|^`]/)
+
+      uri = URI.parse(text)
+      return '' unless uri.is_a?(URI::HTTPS) && uri.userinfo.nil? && uri.query.nil? && uri.fragment.nil?
+      return '' unless uri.host.to_s.match?(/\A[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\z/i)
+
+      uri.to_s.sub(%r{/+\z}, '')
+    rescue URI::InvalidURIError
+      ''
     end
   end
 end

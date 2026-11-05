@@ -70,6 +70,107 @@ class ContentTest < Minitest::Test
     assert_equal 50, Content.name('x' * 80).length
   end
 
+  # ---- hostile text (review findings) ----------------------------------
+
+  # What Discourse does to a description on save: sanitise, then unescape the
+  # entities of the result. Anything that is HTML after this is a leak.
+  def discourse_unescaped(text)
+    CGI.unescapeHTML(text.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;'))
+  end
+
+  def test_double_encoded_entities_cannot_become_html_after_discourses_own_unescape
+    ['&amp;lt;a href=&amp;quot;//evil.com&amp;quot;&amp;gt;Official airdrop&amp;lt;/a&amp;gt;',
+     '&amp;lt;img src=x onerror=alert(1)&amp;gt;', '&amp;amp;amp;amp;amp;amp;amp;lt;b&amp;amp;amp;amp;amp;amp;amp;gt;',
+     '&ltscript&gt;alert(1)&lt;/script&gt;', '&#x3C;a href=x&#x3E;', '＆lt；b＆gt；'].each do |hostile|
+      out = Content.plain_text(hostile, 500)
+      refute_match(/[<>]/, out, hostile)
+      refute_match(/&/, out, hostile)
+      refute_match(/[<>]/, discourse_unescaped(out), hostile)
+    end
+    assert_equal 'Official airdrop', Content.plain_text('&amp;lt;a href=&amp;quot;//evil.com&amp;quot;&amp;gt;Official airdrop&amp;lt;/a&amp;gt;', 500)
+  end
+
+  def test_entity_encoded_urls_are_still_removed
+    assert_equal 'x', Content.plain_text('h&amp;#116;tps://evil.com x', 100)
+    assert_equal 'x', Content.plain_text('h&#116;tps://evil.com x', 100)
+    refute_includes Content.plain_text('www&#46;evil.test', 100), 'evil'
+  end
+
+  def test_an_ampersand_is_kept_as_a_harmless_lookalike
+    assert_equal "R\uFF06D", Content.plain_text('R&D', 100)
+  end
+
+  def test_invisible_characters_cannot_be_smuggled_in_as_entities
+    assert_equal 'Moderator', Content.name('&#x202E;Moderator')
+    assert_equal 'Admin', Content.name('Admin&#x200B;')
+    assert_equal 'Admin', Content.name('Admin&amp;#x200B;')
+    assert_equal 'a b', Content.plain_text('a&#0;b', 100)
+    assert_equal 'ok', Content.plain_text('&#xD800;&#x110000;ok', 100).delete("\uFF06#x0123456789;")
+  end
+
+  def test_invisible_format_and_control_characters_are_removed_by_category
+    ["\u061C", "\u00AD", "\u180E", "\u034F", "\uFE0F", "\u3164", "\uFFA0", "\u115F", "\u{E0041}", "\u{E0100}", "\u2060", "\uFEFF",
+     "\u200D", "\u202E", "\u2066", "\u009B", "\u0085", "\u0007", "\u0000"].each do |ch|
+      out = Content.name("Mod#{ch}erator")
+      assert_match(/\AMod ?erator\z/, out, "U+#{ch.ord.to_s(16)} survived: #{out.inspect}")
+      refute_match(/[\p{Cf}\p{Cc}\uFE0F\u061C\u180E\u034F\u3164]/, out)
+    end
+  end
+
+  def test_unicode_spaces_collapse_and_a_blank_looking_name_is_nil
+    assert_equal 'a b c', Content.plain_text("a\u00A0b\u3000c", 100)
+    assert_equal 'a b', Content.plain_text("  a\u2003\u2009b\u00A0 ", 100)
+    assert_nil Content.name(" \u3000\u00A0\u200B")
+  end
+
+  def test_names_are_nfkc_normalised
+    assert_equal 'Admin', Content.name("\uFF21\uFF44\uFF4D\uFF49\uFF4E")
+  end
+
+  def test_name_keys_ignore_case_spaces_invisibles_and_compatibility_forms
+    key = Content.name_key('Moderator')
+    ["Moderator\u00A0", "Moder\u200Bator", 'MODERATOR', "\uFF2Doderator", "  Moderator\u3000", "Moderator\u061C"].each do |variant|
+      assert_equal key, Content.name_key(variant), variant.inspect
+    end
+    assert_equal Content.name_key('First Like'), Content.name_key("first\u00A0\u00A0like")
+    assert_equal 'first_like', Content.name_key('First  Like')
+  end
+
+  def test_a_lookalike_of_a_taken_name_is_suffixed
+    taken = Set.new([Content.name_key('Moderator')])
+    assert_equal 'Moderator (#9)', Content.choose_name("Moderator\u00A0", 9, taken: taken)
+    assert_equal 'Moderator (#9)', Content.choose_name("Moderator\u200B", 9, taken: taken)
+  end
+
+  def test_percent_sequences_can_never_reach_i18n_interpolation
+    ['%{base_uri} hi', '%{x}', '%<a>d', '%%{scope}', '100% sure', '%{max_likes_per_day}'].each do |hostile|
+      out = Content.plain_text(hostile, 500)
+      refute_includes out, '%', hostile
+      refute_includes Content.name(hostile).to_s, '%'
+      refute_includes Content.long_description(hostile, 1, app_url: 'https://app.example.com'), '%'
+    end
+    assert_equal '100 percent sure', Content.plain_text('100% sure', 100)
+  end
+
+  def test_hostile_megabyte_inputs_finish_quickly
+    hostile = ['a@' * 600_000, '<script ' * 130_000, '<' * 1_000_000, '<!--' * 250_000, '![' * 500_000, '[a](' * 250_000,
+               '[a][' * 250_000, ' ' * 1_000_000 + '1.', '&amp;' * 200_000, 'http://' * 140_000, "\n#" * 500_000, '[' * 1_000_000,
+               "\uFDFA" * 100_000, '&#x0' * 250_000, "\t" * 1_000_000 + '-']
+    hostile.each do |input|
+      started = Time.now
+      Content.plain_text(input, Content::DESCRIPTION_MAX)
+      Content.name(input)
+      Content.long_description(input, 1, app_url: 'https://app.example.com')
+      assert_operator Time.now - started, :<, 1.0, "#{input[0, 12].inspect} took #{Time.now - started}s"
+    end
+  end
+
+  def test_input_is_cut_before_any_pattern_runs
+    out = Content.plain_text("#{'x' * Content::INPUT_MAX} secret-tail-marker", 100_000)
+    refute_includes out, 'secret-tail-marker'
+    assert_operator out.length, :<=, Content::INPUT_MAX
+  end
+
   def test_token_ids_are_plain_decimals_only
     assert_equal 13, Content.token_id('13')
     assert_equal 13, Content.token_id(13)
@@ -170,16 +271,56 @@ class ImageUrlTest < Minitest::Test
 end
 
 class LongDescriptionTest < Minitest::Test
-  def test_includes_our_link_only_for_an_https_app_url
+  LINK = '<a href="https://app.example.com/badges/13">View this badge in the outpost</a>'
+
+  def test_includes_our_link_as_html_only_for_an_https_app_url
     with = Content.long_description('Hi', 13, app_url: 'https://app.example.com/')
-    assert_includes with, '[View this badge in the outpost](https://app.example.com/badges/13)'
+    assert with.end_with?(LINK), with
+    assert_includes with, 'Hi<br><br>Mirrored from'
+    refute_includes with, '](' # no markdown: Discourse renders this field as sanitised HTML
     refute_includes Content.long_description('Hi', 13, app_url: 'http://app.example.com'), 'View this badge'
     refute_includes Content.long_description('Hi', 13), 'View this badge'
   end
 
-  def test_stays_under_the_discourse_limit
-    out = Content.long_description('d' * 500, 13, app_url: 'https://app.example.com')
-    assert out.length <= 1000
+  def test_the_app_url_setting_is_never_trusted
+    ['https://app.example.com/"><script>alert(1)</script>', 'https://app.example.com/" onclick="x', "https://app.example.com/a'b",
+     'https://user:pw@app.example.com', 'https://app.example.com?x=1', 'https://app.example.com#frag', 'javascript:alert(1)',
+     'https://', 'https:///x', 'https://app example.com', "https://app.example.com/\nx", 'https://app.example.com/a%7Bb',
+     'https://app.example.com/%{base_uri}', 'https://ap<p.example.com', 'ftp://app.example.com', "https://#{'a' * 300}.com",
+     'https://app.example.com/a&b', 'https://app.example.com/a<b', "https://app.example.com\\evil.com", 'https://exämple.com'].each do |bad|
+      assert_equal '', Content.app_url(bad), bad
+      out = Content.long_description('Hi', 13, app_url: bad)
+      refute_includes out, '<a ', bad
+      refute_includes out, 'script'
+    end
+  end
+
+  def test_app_url_normalisation
+    assert_equal 'https://app.example.com', Content.app_url(' https://app.example.com/// ')
+    assert_equal 'https://app.example.com:8443/outpost', Content.app_url('https://app.example.com:8443/outpost/')
+    assert_equal '', Content.app_url(nil)
+    assert_equal '', Content.app_url('   ')
+  end
+
+  def test_stays_under_the_discourse_limit_and_never_cuts_the_markup
+    ['d' * 500, 'd ' * 900, "<b>x</b>#{'é' * 800}"].each do |description|
+      out = Content.long_description(description, 13, app_url: 'https://app.example.com')
+      assert out.length <= 1000, out.length
+      assert out.end_with?(LINK), out
+      assert_equal 1, out.scan('<a ').size
+      assert_equal 1, out.scan('</a>').size
+      refute_includes out, '<b>'
+    end
+  end
+
+  def test_the_description_inside_is_plain_text
+    out = Content.long_description('&amp;lt;img src=x onerror=1&amp;gt; %{x} https://evil.test', 13, app_url: '')
+    refute_match(/[<&%]/, out.gsub('<br><br>', ''))
+    refute_includes out, 'evil.test'
+  end
+
+  def test_stays_under_the_limit_without_a_link
+    assert Content.long_description('d' * 500, 13).length <= 1000
   end
 end
 
