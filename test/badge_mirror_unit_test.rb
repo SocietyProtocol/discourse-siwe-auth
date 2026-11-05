@@ -910,8 +910,13 @@ class MirrorHoldersTest < Minitest::Test
     @badge = @world.records[13][:badge_id]
   end
 
-  def run_mirror(users, holdings, mode: 'enforce', **opts)
-    mirror(@world, users: users, holdings: holdings, **opts).run(mode: mode)
+  # Callers pass chain holdings as a braceless trailing hash (address => {...}).
+  # Ruby 3 turns that into keywords, so the address keys arrive in opts.
+  def run_mirror(users, holdings = {}, **opts)
+    mode = opts.delete(:mode) || 'enforce'
+    addresses = opts.reject { |key, _| key.is_a?(Symbol) }
+    opts = opts.select { |key, _| key.is_a?(Symbol) }
+    mirror(@world, users: users, holdings: holdings.merge(addresses), **opts).run(mode: mode)
   end
 
   def test_holder_is_granted_and_non_holder_is_not
