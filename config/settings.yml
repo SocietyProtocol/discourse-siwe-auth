@@ -56,3 +56,30 @@ discourse_siwe:
     choices:
       - subgraph
       - rpc
+  siwe_badges_sync_mode:
+    default: 'off'
+    type: enum
+    choices:
+      - 'off'
+      - log
+      - enforce
+  siwe_badges_community_allowlist:
+    type: list
+    default: ''
+  siwe_badges_revoke_floor:
+    default: 5
+    min: 0
+  siwe_badges_revoke_percent:
+    default: 20
+    min: 0
+    max: 100
+  siwe_badges_revoke_confirmations:
+    default: 2
+    min: 1
+    max: 10
+  siwe_badges_notify_on_grant:
+    default: true
+  siwe_badges_app_url:
+    default: ''
+  siwe_badges_disable_system:
+    default: false

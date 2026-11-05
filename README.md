@@ -272,6 +272,7 @@ suite.
 ruby test/ens_unit_test.rb
 ruby test/society_unit_test.rb
 ruby test/light_account_unit_test.rb
+ruby -r./test/support/pure_keccak -rtime test/badge_mirror_unit_test.rb
 ```
 
 `test/light_account_unit_test.rb` checks the Light Account derivation against
@@ -488,6 +489,154 @@ sudo -u postgres psql discourse -c "
 
 Users who signed in as `S` after the deploy and have no row in the backup keep
 their `S` account. Drop the `siwe_backup_*` tables once the switch is settled.
+
+## On-chain badges (F1)
+
+The plugin mirrors Society Protocol badges into native Discourse badges, so
+`/badges`, badge pages, user cards, featured badges and notifications keep
+working unchanged. Two things are mirrored:
+
+1. **The catalog.** Every official on-chain badge (and the community badges you
+   allow) becomes a `Badge` row in a "Society Protocol" badge grouping. Name,
+   description and image come from the badge metadata. Badges that disappear
+   from the chain are archived (`enabled = false`), never deleted.
+2. **The holders.** A member gets the native badge when the wallets linked to
+   their account hold it on chain, and loses it when they no longer do.
+
+Everything ships **off** (`siwe_badges_sync_mode` = `off`).
+
+### How it decides
+
+* **Catalog source:** the query gateway's registered `Badges` operation with
+  `where: {isProfile: false}`, sent with the bearer token in
+  `siwe_society_subgraph_token` to `siwe_society_subgraph_url`. The document
+  in `lib/discourse_siwe/badge_catalog.rb` is a copy of the gateway registry
+  entry and must change together with it (a unit test compares them when the
+  subgraph repo sits next to this one). The subgraph always returns
+  `imageUrl` and `description` as null at the top level; the real values are
+  in `metadata`. A null `metadata` means "unknown, keep what we have", never
+  "clear".
+* **Holdings source:** the badges contract, via `balanceOfBatch`
+  (`siwe_society_badges_rpc_url`, `siwe_society_badges_contract`,
+  `siwe_society_badges_chain_id`), over the member's wallet and proven owner
+  EOA, and only for mirrored badge ids. The subgraph's holder set is never
+  used to decide who holds a badge. A balance that could not be read is
+  "unknown" and never revokes.
+* **Scope:** official badges, plus the community badge token ids in
+  `siwe_badges_community_allowlist`. Community names, descriptions and images
+  are chosen by their creators: text is reduced to plain text (no HTML,
+  markdown or links) and length capped (name 50, description 500, long
+  description 1000); images must be https (IPFS forms are rewritten to one
+  gateway), at most 2 MB, and actually a PNG, JPEG, GIF, WebP or SVG;
+  downloads go through `FileHelper.download`, which refuses private and
+  loopback addresses and re-checks redirects.
+* **Names:** Discourse badge names are unique and double as translation keys.
+  A name that is taken (case and spaces ignored) gets the suffix ` (#<token id>)`.
+  A chosen name is kept until the chain name really changes.
+* **State:** the badge-to-token mapping lives in the plugin store (key
+  `badge_mirror:token:<id>`: badge id, uri, image source and hash, upload id,
+  last seen, archived). There is no table and no migration. `Badge.query` is
+  NULL, `system` false, `multiple_grant` false; official badges are Gold,
+  community badges Silver (constants in `badge_catalog.rb`).
+* **Duplicates:** accounts that share any address (the Light Account rewrite
+  can leave duplicates) are one person; the lowest user id keeps the badges.
+  This does not depend on which address is the account's wallet today.
+* **Who is evaluated:** active, not staged, not anonymous, not suspended, not
+  silenced, with a wallet on record. Everyone else is left exactly as is.
+
+### Safety
+
+* Any source problem blocks every revoke of that run: gateway error or bad
+  response, a catalog that is empty or less than half the size of the last
+  one (or that would archive most mirrored badges), an RPC error, a wrong
+  chain or contract, a blank RPC URL, or no balance readable at all.
+* A member must be seen without the badge `siwe_badges_revoke_confirmations`
+  runs in a row (default 2, so about two hours) before it is revoked.
+* Brake: more than `max(siwe_badges_revoke_floor, siwe_badges_revoke_percent
+  of current grants)` revokes in one run revokes nobody, per badge and across
+  the whole run. A brake, or a blocked run, puts revokes on hold: the
+  per-login job will not revoke until a clean full run clears the hold.
+  After checking the report, `rake 'siwe:badges:sync[enforce,force]'` skips
+  the counters and the brakes once.
+* Mode `log` reads and reports; it writes no badge, grant, upload, setting or
+  counter. Only the report is stored.
+
+### Settings
+
+| Setting | Meaning |
+| --- | --- |
+| `siwe_badges_sync_mode` | `off` (default), `log` (report only), `enforce`. |
+| `siwe_badges_community_allowlist` | Community badge token ids to mirror (pipe separated). |
+| `siwe_badges_revoke_floor`, `siwe_badges_revoke_percent` | The revoke brake (5 and 20 by default). |
+| `siwe_badges_revoke_confirmations` | Runs in a row before a revoke or an archive (2). |
+| `siwe_badges_notify_on_grant` | Notify members of new grants (true). The first pass over each badge is always silent. |
+| `siwe_badges_app_url` | Base URL of the Society app for the link on each badge page (blank: no link). |
+| `siwe_badges_disable_system` | Keep Discourse's built-in badges disabled (see below). |
+
+### Triggers
+
+* An hourly scheduled job (`Jobs::SiweBadgeMirror`) does the full reconcile
+  under a `DistributedMutex`. Only it archives badges and decides revokes for
+  everyone.
+* A per-login job (`Jobs::SyncSiweUserBadges`, enqueued from
+  `after_authenticate` and `after_create_account`, never calling the network
+  inline) reconciles that member only, at most once an hour, in `enforce` mode.
+
+### Rake tasks
+
+```bash
+rake 'siwe:badges:sync[log]'              # report only (the default)
+rake 'siwe:badges:sync[enforce]'          # apply
+rake 'siwe:badges:sync[enforce,force]'    # apply, skipping counters and brakes
+rake 'siwe:badges:report'                 # the last full report
+rake 'siwe:badges:disable_system[false]'  # disable the built-in badges (dry run without [false])
+rake 'siwe:badges:purge_system_grants[false]' # DESTRUCTIVE, opt-in (dry run without [false])
+```
+
+Grants and revokes are written to the staff action log as `siwe_badge_sync`.
+
+### Rollout order
+
+1. Deploy with `siwe_badges_sync_mode` = `off`. Set the subgraph URL and token
+   and the badges RPC URL, chain id and contract; set `siwe_badges_app_url`.
+2. Turn the mode to `log`. Read `rake siwe:badges:report`: the badges that
+   would be created, their names (collisions), and who would get what.
+   Check the member list and the duplicate accounts it skipped.
+3. Turn the mode to `enforce`. The first run creates the badges and grants
+   silently (the backfill). From the next run on, new holders are notified
+   (`siwe_badges_notify_on_grant`).
+4. Disable the built-in badges: `rake 'siwe:badges:disable_system'` shows what
+   it would do, then `rake 'siwe:badges:disable_system[false]'`. This only
+   disables; it keeps `enable_badges` on (turning that off makes grants
+   return early and `/badges` 404) and deletes nothing. Set
+   `siwe_badges_disable_system` so new built-in badges added by a Discourse
+   upgrade are disabled again by the hourly job. (Discourse's own seed does
+   not set `enabled` on existing badges, so an upgrade does not re-enable the
+   ones already disabled.)
+5. Optional and destructive: after a database backup, look at
+   `rake siwe:badges:purge_system_grants` (counts only), then
+   `rake 'siwe:badges:purge_system_grants[false]'` to delete the built-in
+   badges' user grants and their notifications. Check titles and featured
+   badges first.
+
+### Caveats
+
+* The native badge page lists forum users only. Wallet holders who never
+  joined the forum do not appear, so the on-chain holder count and the
+  outpost are the source of truth.
+* Manual edits to a synced badge (name, description, enabled, type) are
+  overwritten on the next run, and manual grants of a synced badge to members
+  with a wallet are revoked by the reconcile.
+* Members without a wallet on record (staff or legacy accounts) get no badges
+  and are never touched. `granted_at` is the sync time: the subgraph has no
+  mint timestamp.
+* Badge images are fetched once per source URL (at most 25 per run, so the
+  first import of a large catalog takes a few runs). A failed fetch keeps the
+  old image and is retried.
+* Badges held on an owner EOA are only found for members whose owner address
+  is proven (`siwe_owner_address`, or the committed address map).
+* The on-chain holder count is not shown: the `Badges` operation does not
+  select `holdersCount`.
 
 ## Troubleshooting and engineering notes
 

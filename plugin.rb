@@ -2,7 +2,7 @@
 
 # name: Web3 Outpost sign-in for Discourse
 # about: Sign in with Ethereum and display your web3 identity (wallet, ENS, or Society Protocol outpost) in Discourse. Forked and extended from signinwithethereum/discourse-siwe-auth by Society Protocol.
-# version: 1.7.0
+# version: 1.8.0
 # authors: Society Protocol
 # url: https://github.com/SocietyProtocol/discourse-siwe-auth
 
@@ -142,6 +142,7 @@ class ::SiweAuthenticator < ::Auth::ManagedAuthenticator
         Jobs.enqueue(:refresh_siwe_identity, user_id: result.user.id)
       end
       enqueue_group_sync(result.user)
+      enqueue_badge_sync(result.user)
     else
       result.extra_data = (result.extra_data || {}).merge(
         wallet_address: wallet,
@@ -170,6 +171,7 @@ class ::SiweAuthenticator < ::Auth::ManagedAuthenticator
       user.custom_fields['siwe_owner_address'] = owner_address if owner_address.present?
       user.save_custom_fields
       enqueue_group_sync(user)
+      enqueue_badge_sync(user)
     end
 
     return unless SiteSetting.siwe_society_enabled
@@ -201,6 +203,16 @@ class ::SiweAuthenticator < ::Auth::ManagedAuthenticator
     Jobs.enqueue(:sync_siwe_user_groups, user_id: user.id)
   rescue StandardError => e
     Rails.logger.warn("[discourse-siwe-auth] could not enqueue group sync: #{e.class}")
+  end
+
+  # Mirrors the member's on-chain badges shortly after a login. The job
+  # debounces itself; the network is never touched here.
+  def enqueue_badge_sync(user)
+    return unless SiteSetting.siwe_badges_sync_mode == 'enforce'
+
+    Jobs.enqueue(:sync_siwe_user_badges, user_id: user.id)
+  rescue StandardError => e
+    Rails.logger.warn("[discourse-siwe-auth] could not enqueue badge sync: #{e.class}")
   end
 
   # Discourse looks up provider_uid exactly and uid is now always EIP-55
@@ -240,10 +252,18 @@ after_initialize do
   load File.expand_path('../lib/discourse_siwe/gating_planner.rb', __FILE__)
   load File.expand_path('../lib/discourse_siwe/gating_audit.rb', __FILE__)
   load File.expand_path('../lib/discourse_siwe/gating_runner.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/subgraph_client.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/badge_content.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/badge_catalog.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/badge_mirror.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/badge_mirror_runner.rb', __FILE__)
+  load File.expand_path('../lib/discourse_siwe/system_badges.rb', __FILE__)
   load File.expand_path('../app/controllers/discourse_siwe/auth_controller.rb', __FILE__)
   load File.expand_path('../app/jobs/regular/refresh_siwe_identity.rb', __FILE__)
   load File.expand_path('../app/jobs/regular/sync_siwe_user_groups.rb', __FILE__)
   load File.expand_path('../app/jobs/scheduled/siwe_group_sync.rb', __FILE__)
+  load File.expand_path('../app/jobs/regular/sync_siwe_user_badges.rb', __FILE__)
+  load File.expand_path('../app/jobs/scheduled/siwe_badge_mirror.rb', __FILE__)
 
   DiscourseSiwe::IdentityStore::FIELDS.each do |field|
     User.register_custom_field_type(field, :string)
