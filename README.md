@@ -131,7 +131,39 @@ WalletConnect / Reown project ID. Without a project ID, only injected wallets
 | **Siwe society enabled** | Enable Society Protocol identity resolution and the display-identity toggle. |
 | **Siwe society subgraph url** | _Optional._ The Society Protocol subgraph endpoint. Defaults to the live mainnet endpoint; leave blank to force direct RPC resolution. |
 | **Siwe society badges contract** | Society Protocol Badges (ERC-1155) contract address. Defaults to the current mainnet proxy; update only if the contract is redeployed. |
+| **Siwe society subgraph token** | _Secret._ Bearer token for the query gateway (`GRAPH_QUERY_GATEWAY_TOKEN`). The gateway rejects requests without it, so profile names do not resolve while this is empty. Set via the `DISCOURSE_SIWE_SOCIETY_SUBGRAPH_TOKEN` env var or the admin UI. |
 | **Siwe identity resolution mode** | Preferred resolution mode: `subgraph` (default, falls back to RPC) or `rpc` (direct contract calls only). |
+
+## Token-gated categories
+
+Groups that follow badge holders are described in [Groups follow badges](#configuration) (`siwe_group_badge_mapping`). Token-gated **categories** add the missing half: which groups can see which categories. It is configuration, applied by a rake task, never by a background job.
+
+Put the YAML in the `siwe_gating_config` site setting (it lives in the database, so the production layout is not in this public repo), or point `SIWE_GATING_FILE` at a file for one run.
+
+```yaml
+groups:
+  vip-gold:
+    full_name: VIP Gold          # optional
+    visibility: members          # members (default) | staff | owners
+  governors: {}
+categories:
+  gold-lounge:                   # category slug
+    name: Gold Lounge            # used only if the category is created
+    parent: community            # optional parent slug
+    confirm_restrict: true       # needed to restrict a category that is public today
+    access:                      # group: full | reply | read
+      vip-gold: full
+      governors: read            # higher tiers: just list several groups
+```
+
+* `siwe:gating:provision` shows the plan. `siwe:gating:provision[apply]` applies it. It is idempotent: a second run changes nothing.
+* It only touches the groups and categories named in the YAML, and only a category's permissions (never its name, description, topics or order). Staff always keep full access. `everyone` is never listed: a gated category is gated by leaving it out.
+* New groups are closed (no public join, no requests). Automatic groups (`admins`, `moderators`, `staff`, `trust_level_*`) are refused.
+* Restricting a category that is public today is **blocked** until `confirm_restrict: true` is set, so it cannot happen by accident.
+* `siwe:gating:status` shows drift between the YAML and the forum and what the badge sync would add or remove.
+* `siwe:gating:audit` is the mandatory check before restricting anything. It lists members of a gated group who hold no badge (they would lose access), members with no wallet (they would keep access forever), and gated groups no badge feeds. It exits non-zero until each item is resolved: remove them, grandfather them with `siwe_group_sync_exempt_usernames`, or give them the badge.
+* If Fritz edits a gated category's permissions in the admin UI, `status` reports it as drift and `provision[apply]` puts it back. The YAML wins.
+* Group lists and flair reveal who holds a badge by wallet. Choose each group's `visibility` accordingly.
 
 ## Compatibility notes (Discourse + Ruby 3.4)
 
@@ -239,7 +271,14 @@ suite.
 ```bash
 ruby test/ens_unit_test.rb
 ruby test/society_unit_test.rb
+ruby test/light_account_unit_test.rb
+ruby -r./test/support/pure_keccak -rtime test/badge_mirror_unit_test.rb
 ```
+
+`test/light_account_unit_test.rb` checks the Light Account derivation against
+every pair in `script/forum-address-map.json` and the rewrite planner. Without
+the `keccak` gem it falls back to a pure-Ruby Keccak (`test/support/`); the
+other scripts can use it too: `ruby -rtime -r ./test/support/pure_keccak test/society_unit_test.rb`.
 
 ### Integration tests (require an Ethereum RPC endpoint)
 
@@ -287,7 +326,10 @@ them in user custom fields:
   from the ENS metadata service.
 - `society_badge_id` / `society_name` / `society_avatar` / `society_bio` —
   resolved from Society Protocol using the configured subgraph (default) or
-  direct RPC fallback.
+  direct RPC fallback. When the Light Account has no profile yet, the owner
+  EOA's profile is used.
+- `siwe_owner_address` — the EOA that owns the Light Account, read from the
+  EIP-6492 signature (only when CREATE2 ties it to the signing address).
 
 A default `preferred_identity` is chosen automatically: Society if available,
 otherwise ENS, otherwise wallet. `DisplayNameApplier` then applies it to
@@ -331,6 +373,291 @@ bundle exec rake siwe:migrate_identities[true]
 The task resolves ENS and Society identities, sets the default preference, and
 stores the result in user custom fields. Existing display names are left
 untouched unless the user toggles their preferred identity.
+
+### Moving forum users to Light Accounts
+
+Members sign in as their Light Account `S` (owned by their wallet `E`), not
+as `E`. The SIWE `uid` is always the EIP-55 checksummed address, and Discourse
+matches it exactly. Existing users must be moved from `E` to `S` **before**
+the Light Account login goes live, otherwise their next sign-in creates a new,
+empty forum user for `S`. That login is in every build of this branch from
+`8a4f838` on, not only the final one: check step 0 before assuming it has not
+shipped.
+
+`script/rewrite_smart_account_users.rb` covers every `siwe` account on the
+forum (not only Outpost members). For each one it derives `S` in Ruby, then:
+
+- sets `provider_uid` to checksummed `S`, and `nickname` / `name` in the
+  account's `info` when they held `E`;
+- sets the `wallet_address` custom field to `S` and `siwe_owner_address` to `E`;
+- renames a wallet-style display name (`0x9ba7…7c3c`) to `S`'s short form.
+
+It refuses to run unless its derivation matches every pair in
+`script/forum-address-map.json` (flat or chain-keyed). It skips rows that are
+already Light Accounts (re-runs are no-ops), contract wallets (`eth_getCode`),
+and, with `SUSPECT_AFTER`, rows created after a given time. A row whose uid is
+a Light Account from the map is never rewritten, even with no
+`siwe_owner_address`: it is `adopt` (records `E`) or `recase` (fixes the case
+and records `E`). A uid that is not checksummed and is not in the map is left
+as `review`, since only a script or a hand edit writes another case. If someone
+already signed in as `S` (a duplicate user), it changes neither row and
+prints both user ids and usernames; merge them in the admin UI, or pass
+`MERGE_DUPLICATES=1` to merge the newer user into the original with
+Discourse's `UserMerger`. Writes happen in one transaction.
+
+Do staging (Sepolia) first, then production (mainnet). Light Account
+addresses are the same on both chains; `RPC_URL` only feeds the contract
+wallet check and should point at the forum's chain.
+
+0. Find out whether the forum ever ran a build with the Light Account login
+   (`8a4f838` or later; check the plugin commit in the admin panel or in
+   `app.yml` and the rebuild history). If it did, users who signed in since
+   then are rows for `S` with no recorded owner, and an `S` missing from the
+   map would be rewritten to the Light Account of `S`. Set `SUSPECT_AFTER` to
+   that first deploy time (ISO 8601) in steps 3 and 5. If it never did, pass
+   `NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1` with `APPLY=1` instead; the script
+   refuses to apply with neither.
+
+1. Put the new plugin checkout where the container can read it, without
+   rebuilding yet:
+
+   ```bash
+   cd /var/discourse
+   git clone -b smart-account-login https://github.com/SocietyProtocol/discourse-siwe-auth.git \
+     shared/standalone/tmp/discourse-siwe-auth
+   ./launcher enter app
+   cd /var/www/discourse
+   ```
+
+2. Back up what the rewrite touches (needed for rollback):
+
+   ```bash
+   sudo -u postgres psql discourse -c "
+     CREATE TABLE siwe_backup_accounts AS
+       SELECT * FROM user_associated_accounts WHERE provider_name = 'siwe';
+     CREATE TABLE siwe_backup_fields AS
+       SELECT * FROM user_custom_fields
+       WHERE name IN ('wallet_address', 'siwe_owner_address');
+     CREATE TABLE siwe_backup_names AS
+       SELECT id, name FROM users
+       WHERE id IN (SELECT user_id FROM siwe_backup_accounts);"
+   ```
+
+   With `MERGE_DUPLICATES=1`, also take a full backup (`discourse backup`):
+   merges cannot be undone from these tables.
+
+3. Dry run, and read the table (`rewrite`, `duplicate`, `adopt`, `review`,
+   `contract`, ...):
+
+   ```bash
+   RPC_URL=https://ethereum-rpc.publicnode.com \
+   SUSPECT_AFTER=2026-10-15T16:00:00Z \
+     sudo -E -u discourse bundle exec rails runner \
+     /shared/tmp/discourse-siwe-auth/script/rewrite_smart_account_users.rb
+   ```
+
+   (`SUSPECT_AFTER` per step 0; the value above is an example.) No
+   `rewrite` row may have a `from` that is a known Light Account (the
+   script aborts if one does). Check every `review` row by hand: compare
+   its `from` with the map and the user's history before changing it.
+
+4. Turn off **Discourse siwe enabled**, so nobody signs in with the old page
+   between the rewrite and the rebuild.
+
+5. Apply (same command with `APPLY=1`, the same `SUSPECT_AFTER` or
+   `NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1`, plus `MERGE_DUPLICATES=1` if wanted).
+   Re-run the dry run: every row should now be `already`, apart from the
+   `review` rows you chose to leave.
+
+6. Deploy the plugin (new `siwe.iife.js`, strategy and lookups):
+   `./launcher rebuild app`. Turn **Discourse siwe enabled** back on and sign
+   in once with a migrated wallet: it must land on the existing user.
+
+Rollback (before any merge): turn off **Discourse siwe enabled**, restore the
+backup, then rebuild with the previous plugin commit.
+
+```bash
+sudo -u postgres psql discourse -c "
+  UPDATE user_associated_accounts a SET provider_uid = b.provider_uid, info = b.info
+    FROM siwe_backup_accounts b WHERE a.id = b.id;
+  DELETE FROM user_custom_fields WHERE name = 'siwe_owner_address'
+    AND id NOT IN (SELECT id FROM siwe_backup_fields);
+  UPDATE user_custom_fields f SET value = b.value
+    FROM siwe_backup_fields b WHERE f.id = b.id;
+  UPDATE users u SET name = b.name FROM siwe_backup_names b WHERE u.id = b.id;"
+```
+
+Users who signed in as `S` after the deploy and have no row in the backup keep
+their `S` account. Drop the `siwe_backup_*` tables once the switch is settled.
+
+## On-chain badges (F1)
+
+The plugin mirrors Society Protocol badges into native Discourse badges, so
+`/badges`, badge pages, user cards, featured badges and notifications keep
+working unchanged. Two things are mirrored:
+
+1. **The catalog.** Every official on-chain badge (and the community badges you
+   allow) becomes a `Badge` row in a "Society Protocol" badge grouping. Name,
+   description and image come from the badge metadata. Badges that disappear
+   from the chain are archived (`enabled = false`), never deleted.
+2. **The holders.** A member gets the native badge when the wallets linked to
+   their account hold it on chain, and loses it when they no longer do.
+
+Everything ships **off** (`siwe_badges_sync_mode` = `off`).
+
+### How it decides
+
+* **Catalog source:** the query gateway's registered `Badges` operation with
+  `where: {isProfile: false}`, sent with the bearer token in
+  `siwe_society_subgraph_token` to `siwe_society_subgraph_url`. The document
+  in `lib/discourse_siwe/badge_catalog.rb` is a copy of the gateway registry
+  entry and must change together with it (a unit test compares them when the
+  subgraph repo sits next to this one). The subgraph always returns
+  `imageUrl` and `description` as null at the top level; the real values are
+  in `metadata`. A null `metadata` means "unknown, keep what we have", never
+  "clear".
+* **Holdings source:** the badges contract, via `balanceOfBatch`
+  (`siwe_society_badges_rpc_url`, `siwe_society_badges_contract`,
+  `siwe_society_badges_chain_id`), over the member's wallet and proven owner
+  EOA, and only for mirrored badge ids. The subgraph's holder set is never
+  used to decide who holds a badge. A balance that could not be read is
+  "unknown" and never revokes.
+* **Scope:** official badges, plus the community badge token ids in
+  `siwe_badges_community_allowlist`. Community names, descriptions and images
+  are chosen by their creators: the input is cut to 4096 characters first,
+  HTML entities are decoded to a fixed point (so a double-encoded tag cannot
+  survive), and the text is reduced to plain text: no HTML, markdown, links or
+  e-mail addresses, Unicode NFKC, every invisible, bidi, control and format
+  character removed by category, every kind of space collapsed, `%` and `&`
+  neutralised (Discourse interpolates `%{...}` in descriptions and unescapes
+  entities after sanitising). Lengths are capped (name 50, description 500,
+  long description 1000). The long description is sanitised HTML (that is how
+  Discourse renders it) whose only link is ours, built from
+  `siwe_badges_app_url` after validation (https, plain host, no userinfo,
+  query or fragment). Images must be https (IPFS forms are rewritten to one
+  gateway), at most 2 MB, and actually a PNG, JPEG, GIF, WebP or SVG;
+  downloads go through `FileHelper.download`, which refuses private and
+  loopback addresses and re-checks redirects. A whole download is cut off
+  after 25 seconds, and a source that failed is not tried again for 24 hours
+  (unless the badge points at another URL).
+* **Names:** Discourse badge names are unique and double as translation keys.
+  A name that is taken (case, spaces, invisible characters and Unicode
+  compatibility forms ignored) gets the suffix ` (#<token id>)`.
+  A chosen name is kept until the chain name really changes.
+* **State:** the badge-to-token mapping lives in the plugin store (key
+  `badge_mirror:token:<id>`: badge id, uri, image source and hash, upload id,
+  last seen, archived). There is no table and no migration. `Badge.query` is
+  NULL, `system` false, `multiple_grant` false; official badges are Gold,
+  community badges Silver (constants in `badge_catalog.rb`).
+* **Duplicates:** accounts that share any address (the Light Account rewrite
+  can leave duplicates) are one person; the lowest user id keeps the badges.
+  This does not depend on which address is the account's wallet today. The
+  person is judged by the holdings of ALL the group's addresses, so a badge
+  that sits only on a duplicate's Light Account still counts, even when the
+  address map is missing or stale. A duplicate's badge is never revoked on an
+  unreadable balance.
+* **Who is evaluated:** active, not staged, not anonymous, not suspended, not
+  silenced, with a wallet on record. Everyone else is left exactly as is.
+
+### Safety
+
+* Any source problem blocks every revoke of that run: gateway error or bad
+  response, a catalog that is empty or less than half the size of the last
+  one (or that would archive most mirrored badges), an RPC error, a wrong
+  chain or contract, a blank RPC URL, or no balance readable at all.
+* A member must be seen without the badge `siwe_badges_revoke_confirmations`
+  runs in a row (default 2, so about two hours) before it is revoked.
+* Brake: more than `max(siwe_badges_revoke_floor, siwe_badges_revoke_percent
+  of current grants)` revokes in one run revokes nobody, per badge and across
+  the whole run. A brake, or a blocked run, raises a revoke hold, shown in
+  the report and cleared by the next clean full run.
+  After checking the report, `rake 'siwe:badges:sync[enforce,force]'` skips
+  the counters and the brakes once.
+* Only the hourly full run revokes. The per-login job is add-only: it never
+  revokes and never reads, advances or writes the counters or the hold, so it
+  cannot race the full run or confirm an absence on its own.
+* A badge whose Badge row was deleted is rebuilt as a fresh badge: its first
+  pass over the holders is silent again (no notification for every holder).
+* Mode `log` reads and reports; it writes no badge, grant, upload, setting or
+  counter. Only the report is stored.
+
+### Settings
+
+| Setting | Meaning |
+| --- | --- |
+| `siwe_badges_sync_mode` | `off` (default), `log` (report only), `enforce`. |
+| `siwe_badges_community_allowlist` | Community badge token ids to mirror (pipe separated). |
+| `siwe_badges_revoke_floor`, `siwe_badges_revoke_percent` | The revoke brake (5 and 20 by default). |
+| `siwe_badges_revoke_confirmations` | Runs in a row before a revoke or an archive (2). |
+| `siwe_badges_notify_on_grant` | Notify members of new grants (true). The first pass over each badge is always silent. |
+| `siwe_badges_app_url` | Base URL of the Society app for the link on each badge page (blank: no link). Used only when it is an https URL with a plain host, no userinfo, query, fragment or special characters; anything else means no link. |
+| `siwe_badges_disable_system` | Keep Discourse's built-in badges disabled (see below). |
+
+### Triggers
+
+* An hourly scheduled job (`Jobs::SiweBadgeMirror`) does the full reconcile
+  under a `DistributedMutex`. Only it archives badges and decides revokes for
+  everyone (after `siwe_badges_revoke_confirmations` runs in a row).
+* A per-login job (`Jobs::SyncSiweUserBadges`, enqueued from
+  `after_authenticate` and `after_create_account`, never calling the network
+  inline) grants that member what they hold, add-only, at most once an hour,
+  in `enforce` mode.
+
+### Rake tasks
+
+```bash
+rake 'siwe:badges:sync[log]'              # report only (the default)
+rake 'siwe:badges:sync[enforce]'          # apply
+rake 'siwe:badges:sync[enforce,force]'    # apply, skipping counters and brakes
+rake 'siwe:badges:report'                 # the last full report
+rake 'siwe:badges:disable_system[false]'  # disable the built-in badges (dry run without [false])
+rake 'siwe:badges:purge_system_grants[false]' # DESTRUCTIVE, opt-in (dry run without [false])
+```
+
+Grants and revokes are written to the staff action log as `siwe_badge_sync`.
+
+### Rollout order
+
+1. Deploy with `siwe_badges_sync_mode` = `off`. Set the subgraph URL and token
+   and the badges RPC URL, chain id and contract; set `siwe_badges_app_url`.
+2. Turn the mode to `log`. Read `rake siwe:badges:report`: the badges that
+   would be created, their names (collisions), and who would get what.
+   Check the member list and the duplicate accounts it skipped.
+3. Turn the mode to `enforce`. The first run creates the badges and grants
+   silently (the backfill). From the next run on, new holders are notified
+   (`siwe_badges_notify_on_grant`).
+4. Disable the built-in badges: `rake 'siwe:badges:disable_system'` shows what
+   it would do, then `rake 'siwe:badges:disable_system[false]'`. This only
+   disables; it keeps `enable_badges` on (turning that off makes grants
+   return early and `/badges` 404) and deletes nothing. Set
+   `siwe_badges_disable_system` so new built-in badges added by a Discourse
+   upgrade are disabled again by the hourly job. (Discourse's own seed does
+   not set `enabled` on existing badges, so an upgrade does not re-enable the
+   ones already disabled.)
+5. Optional and destructive: after a database backup, look at
+   `rake siwe:badges:purge_system_grants` (counts only), then
+   `rake 'siwe:badges:purge_system_grants[false]'` to delete the built-in
+   badges' user grants and their notifications. Check titles and featured
+   badges first.
+
+### Caveats
+
+* The native badge page lists forum users only. Wallet holders who never
+  joined the forum do not appear, so the on-chain holder count and the
+  outpost are the source of truth.
+* Manual edits to a synced badge (name, description, enabled, type) are
+  overwritten on the next run, and manual grants of a synced badge to members
+  with a wallet are revoked by the reconcile.
+* Members without a wallet on record (staff or legacy accounts) get no badges
+  and are never touched. `granted_at` is the sync time: the subgraph has no
+  mint timestamp.
+* Badge images are fetched once per source URL (at most 25 per run, so the
+  first import of a large catalog takes a few runs). A failed fetch keeps the
+  old image and is retried.
+* Badges held on an owner EOA are only found for members whose owner address
+  is proven (`siwe_owner_address`, or the committed address map).
+* The on-chain holder count is not shown: the `Badges` operation does not
+  select `holdersCount`.
 
 ## Troubleshooting and engineering notes
 
