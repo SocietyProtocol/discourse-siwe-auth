@@ -128,7 +128,9 @@ module DiscourseSiwe
     # Downloads (SSRF guarded by FinalDestination: private/loopback ranges and
     # DNS rebinding are refused, redirects are re-checked), keeps only real
     # image types under the size cap, and stores it as a badge_image upload.
-    # => { upload_id:, hash: } or nil. Never raises.
+    # => { upload_id:, hash: } or nil. Never raises. read_timeout is only a
+    # per-read limit; the total time is bounded by BadgeMirror (image_timeout),
+    # which also backs off a source that keeps failing.
     def fetch_image(url)
       tmp = FileHelper.download(
         url, max_file_size: BadgeContent::IMAGE_MAX_BYTES, tmp_file_name: 'siwe-badge',

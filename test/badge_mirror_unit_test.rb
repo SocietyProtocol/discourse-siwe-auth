@@ -659,7 +659,7 @@ class MirrorCatalogTest < Minitest::Test
     assert_equal 10, world.badge_rows.values.first[:image_upload_id]
   end
 
-  def test_a_failed_image_fetch_keeps_the_old_image_and_retries_next_run
+  def test_a_failed_image_fetch_keeps_the_old_image
     world = World.new
     mirror(world).run(mode: 'enforce')
     world.images = ->(_url) { nil }
@@ -728,6 +728,96 @@ class MirrorCatalogTest < Minitest::Test
     report = mirror(world).run(mode: 'enforce')
     assert_equal [13], report[:catalog][:created]
     assert world.badge_rows[world.records[13][:badge_id]]
+  end
+
+  def test_a_recreated_badge_is_a_fresh_silent_backfill_not_a_notification_for_every_holder
+    world = World.new
+    mirror(world).run(mode: 'enforce')
+    mirror(world, users: [user(1, A)], holdings: { A => { 13 => 1 } }).run(mode: 'enforce')
+    assert world.records[13][:backfilled]
+    old_badge = world.records[13][:badge_id]
+    world.badge_rows.clear # an admin deleted the badge
+    world.grants_log.clear
+
+    users = [user(1, A), user(2, B), user(3, C)]
+    holdings = { A => { 13 => 1 }, B => { 13 => 1 }, C => { 13 => 1 } }
+    later = NOW + 3600
+    report = mirror(world, users: users, holdings: holdings, now: later).run(mode: 'enforce')
+    assert_equal [13], report[:catalog][:created]
+    refute_equal old_badge, world.records[13][:badge_id]
+    assert_equal [true, true, true], world.grants_log.map(&:last), 'a rebuilt badge must be granted silently'
+    assert world.records[13][:backfilled], 'and be marked backfilled after its first pass'
+    assert_equal later.utc.iso8601, world.records[13][:last_seen_at]
+
+    mirror(world, users: users + [user(4, D)], holdings: holdings.merge(D => { 13 => 1 }), now: later + 3600).run(mode: 'enforce')
+    assert_equal false, world.grants_log.last.last, 'later holders are notified again'
+  end
+
+  def test_a_recreated_badge_resets_its_image_state
+    world = World.new
+    mirror(world).run(mode: 'enforce')
+    world.badge_rows.clear
+    fetched = []
+    world.images = ->(url) { fetched << url; { upload_id: 77, hash: 'new' } }
+    mirror(world).run(mode: 'enforce')
+    assert_equal 1, fetched.size
+    assert_equal 77, world.records[13][:image_upload_id]
+    assert_equal 77, world.badge_rows[world.records[13][:badge_id]][:image_upload_id]
+  end
+
+  def test_a_hung_image_download_cannot_stall_the_run
+    world = World.new
+    world.images = ->(_url) { sleep 10; { upload_id: 1, hash: 'x' } }
+    started = Time.now
+    report = mirror(world, users: [user(1, A)], holdings: { A => { 13 => 1 } }, config: { image_timeout: 0.2 }).run(mode: 'enforce')
+    assert_operator Time.now - started, :<, 3
+    assert_equal 1, report[:catalog][:images][:failed]
+    assert_equal 0, report[:catalog][:images][:fetched]
+    assert_equal :errors, report[:status]
+    assert_match(/Timeout/, report[:errors].first)
+    assert_equal [world.records[13][:badge_id]], world.user_badges.keys, 'the holder step still ran'
+  end
+
+  def test_an_image_that_raises_counts_as_failed
+    world = World.new
+    world.images = ->(_url) { raise IOError, 'boom' }
+    report = mirror(world).run(mode: 'enforce')
+    assert_equal 1, report[:catalog][:images][:failed]
+    assert_equal [13], world.records.keys
+  end
+
+  def test_a_failing_image_source_is_backed_off_for_a_day_unless_the_url_changes
+    world = World.new
+    calls = []
+    world.images = ->(url) { calls << url; nil }
+    rows = [row(13)]
+    mirror(world, rows: rows, now: NOW).run(mode: 'enforce')
+    assert_equal 1, calls.size
+    assert_equal NOW.utc.iso8601, world.records[13][:image_failed_at]
+    assert_equal 'https://ipfs.filebase.io/ipfs/bafy/a.png', world.records[13][:image_failed_source]
+
+    mirror(world, rows: rows, now: NOW + 3600).run(mode: 'enforce')
+    mirror(world, rows: rows, now: NOW + 23 * 3600).run(mode: 'enforce')
+    assert_equal 1, calls.size, 'no retry inside 24h'
+
+    mirror(world, rows: rows, now: NOW + 25 * 3600).run(mode: 'enforce')
+    assert_equal 2, calls.size, 'retried after 24h'
+
+    other = [row(13, 'metadata' => { 'description' => 'About 13', 'imageUrl' => 'https://cdn.example.com/other.png' })]
+    mirror(world, rows: other, now: NOW + 25 * 3600 + 60).run(mode: 'enforce')
+    assert_equal 3, calls.size, 'a changed source is tried at once'
+    assert_equal 'https://cdn.example.com/other.png', calls.last
+  end
+
+  def test_a_success_clears_the_failure_memory
+    world = World.new
+    world.images = ->(_url) { nil }
+    mirror(world, now: NOW).run(mode: 'enforce')
+    world.images = ->(_url) { { upload_id: 5, hash: 'ok' } }
+    mirror(world, now: NOW + 25 * 3600).run(mode: 'enforce')
+    assert_nil world.records[13][:image_failed_at]
+    assert_nil world.records[13][:image_failed_source]
+    assert_equal 5, world.records[13][:image_upload_id]
   end
 
   def test_a_failing_badge_create_is_reported_and_does_not_store_a_record

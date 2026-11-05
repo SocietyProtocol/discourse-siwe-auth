@@ -77,6 +77,9 @@ module DiscourseSiwe
     TYPE_COMMUNITY = 2 # BadgeType::Silver
     GROUPING_NAME = 'Society Protocol'
     SEEN_REFRESH_SECONDS = 24 * 3600
+    # A source that failed to download is not retried for this long (unless
+    # the badge points at another URL).
+    IMAGE_RETRY_SECONDS = 24 * 3600
 
     Entry = Struct.new(:token_id, :name, :official, :community, :uri, :description, :image_source, keyword_init: true)
 
@@ -200,8 +203,11 @@ module DiscourseSiwe
       attrs = desired_attrs(entry, name, entry.description, grouping_id, app_url)
       {
         token_id: entry.token_id, op: :create, attrs: attrs, image_source: entry.image_source,
+        # A rebuild (the Badge row is gone) is a fresh badge: a silent first
+        # pass, not a notification for every holder.
         record: (record || {}).merge(base_record(entry, name, now)).merge(
           archived: false, absent_runs: 0, badge_id: nil, image_source: nil, image_upload_id: nil, image_hash: nil,
+          image_failed_at: nil, image_failed_source: nil, backfilled: false,
         ),
       }
     end
@@ -222,7 +228,8 @@ module DiscourseSiwe
 
       image_needed = entry.image_source &&
                      (record[:image_source] != entry.image_source || record[:image_upload_id].nil? ||
-                      snapshot[:image_upload_id] != record[:image_upload_id])
+                      snapshot[:image_upload_id] != record[:image_upload_id]) &&
+                     !image_backed_off?(record, entry.image_source, now)
 
       changed_record = record[:name_chain] != name || record[:uri] != entry.uri || record[:archived] ||
                        record[:absent_runs].to_i.positive? || record[:official] != entry.official || seen_stale?(record, now)
@@ -236,6 +243,15 @@ module DiscourseSiwe
         token_id: entry.token_id, op: op, attrs: attrs, image_source: image_needed ? entry.image_source : nil,
         record: record.merge(base_record(entry, name, now)).merge(archived: false, absent_runs: 0),
       }
+    end
+
+    # The same source failed less than IMAGE_RETRY_SECONDS ago.
+    def image_backed_off?(record, source, now)
+      return false unless record[:image_failed_source] == source && !record[:image_failed_at].to_s.empty?
+
+      now - Time.parse(record[:image_failed_at].to_s) < IMAGE_RETRY_SECONDS
+    rescue ArgumentError
+      false
     end
 
     def seen_stale?(record, now)

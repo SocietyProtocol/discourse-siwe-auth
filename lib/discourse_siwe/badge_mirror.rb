@@ -2,6 +2,7 @@
 
 require 'set'
 require 'time'
+require 'timeout'
 
 module DiscourseSiwe
   # Needs (loaded by the caller, in this order): BadgeOwnership, GroupSyncPlanner,
@@ -24,7 +25,7 @@ module DiscourseSiwe
   #               #hold? -> bool   #set_hold(bool)
   #   badges      #snapshots(records) #taken_names #grouping_id(create:)
   #               #create(attrs) -> badge_id   #update(badge_id, attrs)
-  #   images      ->(url) { { upload_id:, hash: } | nil }
+  #   images      ->(url) { { upload_id:, hash: } | nil }, bounded by config.image_timeout seconds in total
   #   grants      #holders(badge_id) -> Set of user ids   #grant(badge_id, user_id, suppress:)
   #               #revoke(badge_id, user_id)
   #   users       [{ id:, username:, addresses: [..] }] eligible members with a wallet
@@ -53,13 +54,13 @@ module DiscourseSiwe
 
     # Settings the orchestrator needs. allowlist: Set of token ids.
     Config = Struct.new(
-      :allowlist, :confirmations, :floor, :percent, :notify, :app_url, :max_images,
+      :allowlist, :confirmations, :floor, :percent, :notify, :app_url, :max_images, :image_timeout,
       keyword_init: true
     )
 
     def self.config(**overrides)
       Config.new(
-        **{ allowlist: Set.new, confirmations: 2, floor: 5, percent: 20, notify: true, app_url: '', max_images: 25 }.merge(overrides),
+        **{ allowlist: Set.new, confirmations: 2, floor: 5, percent: 20, notify: true, app_url: '', max_images: 25, image_timeout: 25 }.merge(overrides),
       )
     end
 
@@ -224,18 +225,32 @@ module DiscourseSiwe
       images_left - 1
     end
 
+    # The whole fetch is bounded by config.image_timeout: the image host is
+    # chosen by the badge's creator, and a host that trickles bytes must not
+    # hold up every grant and revoke of the run. A failed source is remembered
+    # (image_failed_at / image_failed_source) so it is not retried every hour.
     def attach_image(record, url, catalog)
-      result = @images && @images.call(url)
+      result = Timeout.timeout(@config.image_timeout) { @images && @images.call(url) }
       if result
         @badges.update(record[:badge_id], image_upload_id: result[:upload_id])
-        @store.save_record(record.merge(image_source: url, image_upload_id: result[:upload_id], image_hash: result[:hash]))
+        @store.save_record(
+          record.merge(image_source: url, image_upload_id: result[:upload_id], image_hash: result[:hash],
+                       image_failed_at: nil, image_failed_source: nil),
+        )
         catalog[:images][:fetched] += 1
       else
-        catalog[:images][:failed] += 1
+        image_failed(record, url, catalog)
       end
-    rescue StandardError => e
-      catalog[:images][:failed] += 1
+    rescue StandardError => e # includes Timeout::Error
       @errors << "token #{record[:token_id]}: image #{e.class}"
+      image_failed(record, url, catalog)
+    end
+
+    def image_failed(record, url, catalog)
+      catalog[:images][:failed] += 1
+      @store.save_record(record.merge(image_failed_at: @now.call.iso8601, image_failed_source: url))
+    rescue StandardError => e
+      @errors << "token #{record[:token_id]}: image state #{e.class}"
     end
 
     # ---- holders ----------------------------------------------------------
