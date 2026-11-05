@@ -11,7 +11,8 @@
 # category, topic and API key.
 require 'net/http'
 
-abort 'refusing: badges chain is not Sepolia' unless SiteSetting.siwe_society_badges_chain_id.to_i == 11_155_111
+SEPOLIA_BADGES = '0x12406bb6d11cb641e100f1d8595c0c5e63f0bd47'
+abort 'refusing: the badges contract is not the Sepolia one (this script is for staging only)' unless SiteSetting.siwe_society_badges_contract.to_s.downcase == SEPOLIA_BADGES
 
 FAILS = []
 def check(label, ok)
@@ -35,8 +36,14 @@ G_GOLD = 'f4-gold'
 G_OTHER = 'f4-other'
 SLUG = 'f4-gold-lounge'
 WORD = "zzgatedcanary#{SecureRandom.hex(3)}"
+# Search endpoints echo the query back, so leaks are detected by the topic text, not the query.
+TITLE_MARK = "Gated canary"
+BODY_MARK = "Secret body"
+def leaked?(body)
+  body.include?(TITLE_MARK) || body.include?(BODY_MARK)
+end
 saved = {}
-%w[siwe_group_badge_mapping siwe_gating_config siwe_group_sync_removal_confirmations siwe_group_sync_removal_floor].each { |s| saved[s] = SiteSetting.public_send(s) }
+%w[siwe_society_badges_chain_id siwe_group_badge_mapping siwe_gating_config siwe_group_sync_removal_confirmations siwe_group_sync_removal_floor].each { |s| saved[s] = SiteSetting.public_send(s) }
 alice = User.find_by!(username: 'rehearsal_alice')
 bob = User.find_by!(username: 'rehearsal_bob')
 admin = User.where(admin: true, active: true).where.not(id: Discourse.system_user.id).first!
@@ -44,6 +51,7 @@ api_key = nil
 topic = nil
 
 begin
+  SiteSetting.siwe_society_badges_chain_id = 11_155_111
   SiteSetting.siwe_group_badge_mapping = "71:#{G_GOLD}|72:#{G_OTHER}"
   SiteSetting.siwe_group_sync_removal_confirmations = 2
   SiteSetting.siwe_group_sync_removal_floor = 3
@@ -100,8 +108,8 @@ begin
   as_bob = http("/t/#{topic.id}.json", username: bob.username, key: k)
   anon = http("/t/#{topic.id}.json")
   check "holder (alice) can read the topic (#{as_alice.code})", as_alice.code == '200'
-  check "non-holder (bob) is refused (#{as_bob.code})", %w[403 404].include?(as_bob.code) && !as_bob.body.include?(WORD)
-  check "anonymous is refused (#{anon.code})", %w[403 404].include?(anon.code) && !anon.body.include?(WORD)
+  check "non-holder (bob) is refused (#{as_bob.code})", %w[403 404].include?(as_bob.code) && !leaked?(as_bob.body)
+  check "anonymous is refused (#{anon.code})", %w[403 404].include?(anon.code) && !leaked?(anon.body)
 
   cat_bob = http("/c/#{category.id}/show.json", username: bob.username, key: k)
   check "category page refused for bob (#{cat_bob.code})", %w[403 404].include?(cat_bob.code)
@@ -117,10 +125,10 @@ begin
     path = path.sub('%s', WORD)
     r_bob = http(path, username: bob.username, key: k)
     r_anon = http(path)
-    check "no leak of the topic at #{path.split('?').first} (bob/anon)", !r_bob.body.include?(WORD) && !r_anon.body.include?(WORD)
+    check "no leak of the topic at #{path.split('?').first} (bob/anon)", !leaked?(r_bob.body) && !leaked?(r_anon.body)
   end
   search_alice = http("/search.json?q=#{WORD}", username: alice.username, key: k)
-  check 'search finds the topic for alice (leak checks are meaningful)', search_alice.body.include?(WORD)
+  check 'search finds the topic for alice (leak checks are meaningful)', search_alice.body.include?(TITLE_MARK)
 
   join = http("/groups/#{G_GOLD}/join", username: bob.username, key: k, method: :post)
   check "bob cannot join the gold group (#{join.code})", join.code != '200' && !gold.reload.users.exists?(bob.id)
