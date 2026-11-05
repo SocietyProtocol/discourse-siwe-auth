@@ -1,10 +1,11 @@
 # frozen_string_literal: true
 
 module Jobs
-  # Per-login badge sync for one member: grants what they hold and revokes
-  # what they no longer hold (with the same confirmation counters, and never
-  # while a failed or braked full run has revokes on hold). Debounced to
-  # about an hour per member. The catalog is left to the scheduled job.
+  # Per-login badge sync for one member: grants what they hold. ADD-ONLY: it
+  # never revokes and never reads or writes the confirmation counters or the
+  # revoke hold, so it cannot race the hourly full run or get around its
+  # brakes. Revokes (and the catalog) belong to the scheduled job, which runs
+  # under a DistributedMutex. Debounced to about an hour per member.
   class SyncSiweUserBadges < ::Jobs::Base
     sidekiq_options queue: 'low'
 

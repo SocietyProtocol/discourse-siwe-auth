@@ -571,6 +571,8 @@ module MirrorHelpers
   B = '0x' + 'b2' * 20
   C = '0x' + 'c3' * 20
   D = '0x' + 'd4' * 20
+  E = '0x' + 'e5' * 20 # an EOA
+  S = '0x' + '51' * 20 # the Light Account it owns
 
   def row(id, extra = {})
     { 'id' => id.to_s, 'name' => "Badge #{id}", 'isOfficial' => true, 'isCommunity' => false, 'uri' => "ipfs://x/#{id}",
@@ -985,6 +987,64 @@ class MirrorHoldersTest < Minitest::Test
     assert_equal({ 5 => 3, 8 => 3 }, result[:skipped])
   end
 
+  # E is an EOA, S the Light Account that E owns. After the rewrite the old row
+  # (4) has E, the new row (9) has S and owner E, so they are one person.
+  def test_a_badge_held_only_on_the_duplicates_light_account_address_counts_for_the_person
+    users = [user(9, S, E), user(4, E)] # 4 wins; its own address list says only E
+    run_mirror(users, S => { 13 => 1 }, E => { 13 => 0 })
+    assert_equal [4], usernames_of(@world, @badge)
+  end
+
+  def test_the_badge_is_not_revoked_from_either_account_just_because_the_winners_own_address_is_empty
+    @world.user_badges[@badge].merge([9]) # migrated E -> S, the badge sits on 9
+    users = [user(9, S, E), user(4, E)]
+    3.times { run_mirror(users, { S => { 13 => 1 }, E => { 13 => 0 } }, config: { confirmations: 1, floor: 5 }) }
+    assert_equal [4], usernames_of(@world, @badge) # the person has it, once, on the oldest account
+    assert_equal [[@badge, 9]], @world.revokes_log, 'only the duplicate loses it, and only because the person holds it'
+  end
+
+  def test_a_stale_or_missing_address_map_still_finds_the_holding_through_the_shared_address
+    # No map pairing S with E: row 9 only knows S and its owner E, row 4 only E.
+    users = [user(4, E), user(9, S, E), user(2, D)]
+    run_mirror(users, S => { 13 => 2 }, D => { 13 => 1 })
+    assert_equal [2, 4], usernames_of(@world, @badge)
+  end
+
+  def test_a_shared_owner_address_links_accounts_even_when_the_holding_is_on_it
+    run_mirror([user(9, S, E), user(4, E)], E => { 13 => 1 })
+    assert_equal [4], usernames_of(@world, @badge)
+  end
+
+  def test_a_duplicates_badge_is_kept_when_the_persons_holdings_cannot_be_read
+    @world.user_badges[@badge].merge([4, 9])
+    users = [user(9, S, E), user(4, E)]
+    # E reads zero, S cannot be read: the person is unknown, so neither account is touched.
+    holdings = ->(addresses, _ids) { addresses.each_with_object({}) { |a, h| h[a] = a == S ? { 13 => nil } : { 13 => 0 } } }
+    ownership_with_other_member = lambda do |addresses, ids|
+      holdings.call(addresses, ids).merge(D => { 13 => 1 })
+    end
+    4.times { run_mirror(users + [user(2, D)], {}, ownership: ownership_with_other_member, config: { confirmations: 1, floor: 5 }) }
+    assert_equal [2, 4, 9], usernames_of(@world, @badge)
+    assert_empty @world.revokes_log
+  end
+
+  def test_a_duplicate_is_revoked_only_when_the_whole_group_reads_absent_and_is_confirmed
+    @world.user_badges[@badge].merge([4, 9])
+    users = [user(9, S, E), user(4, E)]
+    run_mirror(users, { S => { 13 => 0 }, E => { 13 => 0 } }, config: { confirmations: 2, floor: 5 })
+    assert_equal [4, 9], usernames_of(@world, @badge)
+    run_mirror(users, { S => { 13 => 0 }, E => { 13 => 0 } }, config: { confirmations: 2, floor: 5 })
+    assert_empty usernames_of(@world, @badge)
+  end
+
+  def test_dedupe_carries_the_union_of_the_groups_addresses_on_the_winner
+    result = Mirror.dedupe([user(9, S, E), user(4, E), user(1, D)])
+    winner = result[:winners].find { |u| u[:id] == 4 }
+    assert_equal [E, S].sort, winner[:addresses].sort
+    assert_equal [D], result[:winners].find { |u| u[:id] == 1 }[:addresses]
+    assert_equal({ 9 => 4 }, result[:skipped])
+  end
+
   def test_a_duplicate_that_holds_a_badge_loses_it_after_confirmation
     @world.user_badges[@badge].merge([4, 9])
     users = [user(9, A, B), user(4, B, C)]
@@ -1086,21 +1146,70 @@ class MirrorUserRunTest < Minitest::Test
     assert_equal [1, 2], usernames_of(@world, @badge)
   end
 
-  def test_revokes_for_that_user_only_after_confirmation
+  def test_a_login_run_never_revokes_however_often_it_runs
     @world.user_badges[@badge].merge([1, 2])
     users = [user(1, A), user(2, B)]
     holdings = { A => { 13 => 0 }, B => { 13 => 0 } }
-    user_run(users, holdings, [1])
+    5.times { user_run(users, holdings, [1], config: { confirmations: 1 }) }
     assert_equal [1, 2], usernames_of(@world, @badge)
-    user_run(users, holdings, [1])
-    assert_equal [2], usernames_of(@world, @badge)
+    assert_empty @world.revokes_log
   end
 
-  def test_a_hold_from_a_failed_or_braked_full_run_blocks_login_revokes
+  def test_login_runs_cannot_complete_a_confirmation_the_full_run_started
+    # Full run #1 saw user 1 absent once (e.g. a lagging RPC returning zeros).
+    @world.user_badges[@badge].merge([1, 2])
+    users = [user(1, A), user(2, B)]
+    holdings = { A => { 13 => 0 }, B => { 13 => 1 } }
+    mirror(@world, users: users, holdings: holdings).run(mode: 'enforce')
+    assert_equal({ 1 => 1 }, @world.pending['13'])
+    # User 1 logs in before the next hourly run: still not revoked.
+    user_run(users, holdings, [1])
+    assert_equal [1, 2], usernames_of(@world, @badge)
+    assert_equal({ 1 => 1 }, @world.pending['13'], 'the login run did not advance the counter')
+  end
+
+  def test_a_login_run_persists_nothing_but_grants
+    strict = World.new
+    mirror(strict).run(mode: 'enforce')
+    badge = strict.records[13][:badge_id]
+    strict.records[13] = strict.records[13].merge(backfilled: true)
+    strict.pending.replace('13' => { 2 => 1 })
+    strict.hold = true
+    strict.user_badges[badge].merge([2])
+    strict.writes.clear
+    spy = strict.store
+    %i[pending hold? save_pending set_hold save_record save_meta].each do |name|
+      spy.define_singleton_method(name) { |*_args| raise "a login run must not use store.#{name}" }
+    end
+    report = Mirror.new(
+      store: spy, badges: strict, grants: strict, ownership: ->(addresses, _ids) { addresses.each_with_object({}) { |a, h| h[a] = { 13 => (a == A ? 1 : 0) } } },
+      users: [user(1, A), user(2, B)], config: Mirror.config, now: -> { NOW },
+    ).run(mode: 'enforce', user_ids: [1])
+    assert_equal :ok, report[:status]
+    assert_equal [[:grant, badge, 1]], strict.writes
+    assert_equal({ '13' => { 2 => 1 } }, strict.pending)
+    assert_equal true, strict.hold?
+  end
+
+  def test_a_hold_does_not_stop_a_login_grant
     @world.hold = true
-    @world.user_badges[@badge] << 1
-    3.times { user_run([user(1, A)], { A => { 13 => 0 } }, [1], config: { confirmations: 1 }) }
+    user_run([user(1, A)], { A => { 13 => 1 } }, [1])
     assert_equal [1], usernames_of(@world, @badge)
+  end
+
+  def test_a_login_run_on_a_duplicate_account_is_judged_by_the_whole_group
+    users = [user(4, E), user(9, S, E)]
+    user_run(users, { S => { 13 => 1 }, E => { 13 => 0 } }, [9])
+    assert_empty usernames_of(@world, @badge), 'the duplicate itself never gets the badge'
+    user_run(users, { S => { 13 => 1 }, E => { 13 => 0 } }, [4])
+    assert_equal [4], usernames_of(@world, @badge), 'the oldest account does, from the duplicates holding'
+  end
+
+  def test_a_login_run_after_a_failed_full_run_still_only_adds
+    @world.hold = true
+    @world.user_badges[@badge].merge([1, 2])
+    3.times { user_run([user(1, A), user(2, B)], { A => { 13 => 0 }, B => { 13 => 0 } }, [1], config: { confirmations: 1 }) }
+    assert_equal [1, 2], usernames_of(@world, @badge)
   end
 
   def test_a_login_run_does_not_wipe_other_members_counters_or_the_hold
@@ -1108,10 +1217,11 @@ class MirrorUserRunTest < Minitest::Test
     @world.pending.replace('13' => { 2 => 1 })
     user_run([user(1, A), user(2, B)], { A => { 13 => 1 } }, [1])
     assert_equal true, @world.hold?
+    assert_equal({ '13' => { 2 => 1 } }, @world.pending)
     @world.hold = false
     @world.user_badges[@badge].merge([1, 2])
     user_run([user(1, A), user(2, B)], { A => { 13 => 1 }, B => { 13 => 0 } }, [1])
-    assert_equal({ 2 => 1 }, @world.pending['13'].select { |id, _| id == 2 }) if @world.pending['13']
+    assert_equal({ '13' => { 2 => 1 } }, @world.pending)
   end
 
   def test_an_ineligible_user_is_a_no_op

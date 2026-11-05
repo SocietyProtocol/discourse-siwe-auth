@@ -62,8 +62,11 @@ module DiscourseSiwe
       end
     end
 
-    # mode: 'log' | 'enforce'. user_ids: only these members (login job).
-    def run(mode:, user_ids: nil, revoke: true, force: false, persist_report: true)
+    # mode: 'log' | 'enforce'. user_ids: only these members (login job); such
+    # a run is add-only: it grants, never revokes, and touches no counter and
+    # no flag (see BadgeMirror). Not serialised: only the full run takes the
+    # mutex, because the per-login run writes nothing the full run reads.
+    def run(mode:, user_ids: nil, force: false, persist_report: true)
       unless SiteSetting.enable_badges
         result = { status: :error, mode: mode, error: 'enable_badges is off; Discourse refuses grants' }
         store_report(result, user_ids) if persist_report
@@ -76,7 +79,7 @@ module DiscourseSiwe
         grants: GrantStore.new(mode == 'enforce'), users: eligible_users,
         ownership: GroupSyncRunner.ownership, config: config(force: force), log: method(:log),
       )
-      result = mirror.run(mode: mode, user_ids: user_ids, revoke: revoke)
+      result = mirror.run(mode: mode, user_ids: user_ids)
       store_report(result, user_ids) if persist_report
       log("run finished: #{result[:status]}#{" (#{result[:error]})" if result[:error]}")
       result

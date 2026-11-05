@@ -38,8 +38,14 @@ module DiscourseSiwe
   #   * a member must be seen without the badge `confirmations` runs in a row
   #   * brake: per badge and across the whole run, more than max(floor,
   #     percent) revokes at once revokes nobody
-  #   * a brake or a source problem raises a revoke hold; the per-login job
-  #     does not revoke until a clean full run clears it
+  #   * a brake or a source problem raises a revoke hold (kept for the report)
+  #   * a per-login run (user_ids) is ADD-ONLY: it never revokes and never
+  #     reads, advances or writes the confirmation counters or the hold flag,
+  #     so it cannot race the full run or bypass its brakes. Revokes are
+  #     decided only by the full run (serialised by the caller)
+  #   * a person with several accounts (shared addresses) is evaluated over
+  #     the union of all their addresses; a duplicate's grants are only
+  #     revoked when that union was read
   #   * mode 'log' reads and reports; it writes nothing
   class BadgeMirror
     MODES = %w[log enforce].freeze
@@ -61,7 +67,11 @@ module DiscourseSiwe
     # can leave duplicate rows). The lowest user id, the oldest account, keeps
     # the badges; the others get none. Stable across the E/S login flip
     # because it does not depend on which address is the user's wallet today.
-    # => { winners: [user], skipped: { loser_id => winner_id } }
+    #
+    # Each winner carries the UNION of the addresses of its whole group, so
+    # the person is judged by everything they hold, not by the winner's own
+    # (possibly stale or incomplete) address list.
+    # => { winners: [user with merged :addresses], skipped: { loser_id => winner_id } }
     def self.dedupe(users)
       parent = {}
       find = lambda do |x|
@@ -78,7 +88,7 @@ module DiscourseSiwe
       skipped = {}
       groups.each_value do |members|
         winner = members.min_by { |u| u[:id] }
-        winners << winner
+        winners << winner.merge(addresses: members.flat_map { |u| u[:addresses] }.uniq)
         members.each { |u| skipped[u[:id]] = winner[:id] unless u[:id] == winner[:id] }
       end
       { winners: winners.sort_by { |u| u[:id] }, skipped: skipped }
@@ -107,9 +117,9 @@ module DiscourseSiwe
     end
 
     # mode: 'log' | 'enforce'. user_ids: restrict the holder step to these
-    # members (the per-login job; skips the catalog). revoke: false for
-    # add-only runs.
-    def run(mode:, user_ids: nil, revoke: true)
+    # members (the per-login job; skips the catalog). Such a run is add-only
+    # and touches no counter and no flag.
+    def run(mode:, user_ids: nil)
       raise ArgumentError, "mode must be one of #{MODES.join(', ')}" unless MODES.include?(mode)
 
       @mode = mode
@@ -119,8 +129,7 @@ module DiscourseSiwe
       @report = { status: :ok, mode: mode }
 
       if @user_run
-        @revoke_blocked = 'a failed or braked full run left revokes on hold' if @store.hold?
-        @revoke_blocked = 'add-only run' unless revoke
+        @revoke_blocked = 'add-only run'
         records = @store.records
       else
         records = sync_catalog
@@ -239,7 +248,12 @@ module DiscourseSiwe
       evaluated = dedupe[:winners].map { |u| u[:id] } + dedupe[:skipped].keys
       evaluated &= user_ids if user_ids
       evaluated = Set.new(evaluated)
-      owners = dedupe[:winners].select { |u| evaluated.include?(u[:id]) }
+      # Whose holdings are needed: every winner of an evaluated person. A
+      # duplicate account is judged by the holdings of its whole group.
+      needed = Set.new(evaluated.map { |id| dedupe[:skipped][id] || id })
+      owners = dedupe[:winners].select { |u| needed.include?(u[:id]) }
+      losers_of = Hash.new { |h, k| h[k] = [] }
+      dedupe[:skipped].each { |loser, winner| losers_of[winner] << loser }
       @report[:duplicates_skipped] = dedupe[:skipped].select { |id, _| evaluated.include?(id) }.map { |id, winner| { skipped: label(id), kept: label(winner) } } if dedupe[:skipped].any?
       return @report[:badges] = {} if evaluated.empty?
 
@@ -253,7 +267,9 @@ module DiscourseSiwe
       end
       holdings = classify(owners, balances, token_ids)
 
-      pending = @store.pending
+      # A per-login run is add-only and stateless: it neither reads nor writes
+      # the counters.
+      pending = @user_run ? {} : @store.pending
       next_pending = {}
       plans = {}
       live.each do |record|
@@ -262,12 +278,15 @@ module DiscourseSiwe
         key = record[:token_id].to_s
         desired = Set.new
         unknown = Set.new(current - evaluated) # not evaluated (ineligible, suspended, no wallet): untouched
-        owners.each do |user|
-          held = holdings[user[:id]]
+        owners.each do |winner|
+          held = holdings[winner[:id]]
           if held[:held].include?(record[:token_id])
-            desired << user[:id]
+            desired << winner[:id] if evaluated.include?(winner[:id])
           elsif held[:unknown].include?(record[:token_id])
-            unknown << user[:id]
+            # Unreadable for the person: neither the winner nor any duplicate
+            # of theirs may lose the badge on this reading.
+            unknown << winner[:id]
+            unknown.merge(losers_of[winner[:id]])
           end
         end
         plans[record[:token_id]] = [record, current, GroupSyncPlanner.plan(
@@ -278,10 +297,10 @@ module DiscourseSiwe
         next_pending[key] = plans[record[:token_id]].last.next_pending
       end
 
-      apply_plans(plans, next_pending, pending, user_ids)
+      apply_plans(plans, next_pending)
     end
 
-    def apply_plans(plans, next_pending, pending, user_ids)
+    def apply_plans(plans, next_pending)
       revoke_open = @revoke_blocked.nil?
       braked_any = false
 
@@ -305,9 +324,10 @@ module DiscourseSiwe
         mark_backfilled(record) if @enforce && !@user_run
       end
 
-      if @enforce
-        persist_pending(next_pending, pending, user_ids) if revoke_open
-        @store.set_hold(braked_any || !@revoke_blocked.nil?) unless @user_run
+      # Only a full run writes state; a per-login run (add-only) writes grants and nothing else.
+      if @enforce && !@user_run
+        @store.save_pending(next_pending) if revoke_open
+        @store.set_hold(braked_any || !@revoke_blocked.nil?)
       end
     end
 
@@ -335,18 +355,6 @@ module DiscourseSiwe
       return if record[:backfilled] || record[:badge_id].nil?
 
       @store.save_record(record.merge(backfilled: true))
-    end
-
-    def persist_pending(next_pending, pending, user_ids)
-      merged = if user_ids
-        next_pending.each_with_object(pending.dup) do |(key, counts), out|
-          kept = (pending[key] || {}).reject { |id, _| user_ids.include?(id) }
-          out[key] = kept.merge(counts.select { |id, _| user_ids.include?(id) })
-        end
-      else
-        next_pending
-      end
-      @store.save_pending(merged)
     end
 
     def fetch_balances(addresses, token_ids)
