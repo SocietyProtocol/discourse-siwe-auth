@@ -231,14 +231,11 @@ class MemberAddressesTest < Minitest::Test
     assert_equal MAP.merge(other), DiscourseSiwe::MemberAddresses.load_address_map(keyed.path)
   end
 
-  # script/forum-address-map.json does not exist in this plugin version; the
-  # group sync must work with no map at all.
+  # The group sync must work with no address map at all.
   def test_nil_blank_missing_or_broken_map_gives_an_empty_map
     assert_equal({}, DiscourseSiwe::MemberAddresses.load_address_map(nil))
     assert_equal({}, DiscourseSiwe::MemberAddresses.load_address_map(''))
     assert_equal({}, DiscourseSiwe::MemberAddresses.load_address_map(Dir.tmpdir))
-    shipped = File.expand_path('../script/forum-address-map.json', __dir__)
-    assert_equal({}, DiscourseSiwe::MemberAddresses.load_address_map(shipped))
     assert_equal({}, DiscourseSiwe::MemberAddresses.load_address_map('/no/such/file.json'))
     array = Tempfile.new('map')
     array.write('["0x1"]')
