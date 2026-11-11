@@ -2,7 +2,7 @@
 
 # name: Web3 Outpost sign-in for Discourse
 # about: Sign in with Ethereum and display your web3 identity (wallet, ENS, or Society Protocol outpost) in Discourse. Forked and extended from signinwithethereum/discourse-siwe-auth by Society Protocol.
-# version: 1.8.0
+# version: 1.9.0
 # authors: Society Protocol
 # url: https://github.com/SocietyProtocol/discourse-siwe-auth
 
