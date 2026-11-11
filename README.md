@@ -205,6 +205,7 @@ categories:
 * `siwe:gating:provision` shows the plan. `siwe:gating:provision[apply]` applies it. It is idempotent: a second run changes nothing.
 * It only touches the groups and categories named in the YAML, and only a category's permissions (never its name, description, topics or order). Staff always keep full access. `everyone` is never listed: a gated category is gated by leaving it out.
 * New groups are closed (no public join, no requests). Automatic groups (`admins`, `moderators`, `staff`, `trust_level_*`) are refused.
+* A group that already exists is matched without regard to case, in the mapping and in the YAML alike: an existing `Governors` is the `governors` of the config. It keeps its name, members and owners; `siwe:groups:bootstrap` leaves its settings alone, while a group listed under `groups:` in the YAML gets the closed settings above from `provision[apply]`.
 * Restricting a category that is public today is **blocked** until `confirm_restrict: true` is set, so it cannot happen by accident.
 * `siwe:gating:status` shows drift between the YAML and the forum and what the badge sync would add or remove.
 * `siwe:gating:audit` is the mandatory check before restricting anything. It lists members of a gated group who hold no badge (they would lose access), members with no wallet (they would keep access forever), and gated groups no badge feeds. It exits non-zero until each item is resolved: remove them, grandfather them with `siwe_group_sync_exempt_usernames`, or give them the badge.

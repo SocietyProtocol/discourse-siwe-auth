@@ -115,8 +115,11 @@ module DiscourseSiwe
       normalize(current) == normalize(desired)
     end
 
+    # Group names are compared without case, like Discourse does: a group
+    # that existed before the config ("Governors") is the config's
+    # "governors", not drift to repair on every run.
     def normalize(permissions)
-      permissions.each_with_object({}) { |(group, level), out| out[group.to_s] = level.to_sym }
+      permissions.each_with_object({}) { |(group, level), out| out[group.to_s.downcase] = level.to_sym }
     end
 
     # Parents before children, otherwise config order.
