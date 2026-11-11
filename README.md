@@ -315,9 +315,9 @@ suite.
 ### Unit tests (no network needed)
 
 ```bash
-ruby test/ens_unit_test.rb
-ruby test/society_unit_test.rb
-ruby test/society_lookup_unit_test.rb
+ruby -r./test/support/pure_keccak -rtime test/ens_unit_test.rb
+ruby -r./test/support/pure_keccak -rtime test/society_unit_test.rb
+ruby -r./test/support/pure_keccak -rtime test/society_lookup_unit_test.rb
 ruby -r./test/support/pure_keccak -rtime test/group_sync_unit_test.rb
 ruby -r./test/support/pure_keccak -rtime test/gating_unit_test.rb
 ruby -r./test/support/pure_keccak -rtime test/badge_mirror_unit_test.rb
@@ -326,21 +326,23 @@ ruby -r./test/support/pure_keccak -rtime test/badge_mirror_unit_test.rb
 `test/support/pure_keccak.rb` and `test/support/lib/digest/keccak.rb` are a
 test-only pure-Ruby Keccak-256 shim. Requiring `pure_keccak` lets these suites
 run on a machine that does not have the `keccak` gem installed (the plugin
-itself still uses the real gem in Discourse). `-rtime` loads `Time.iso8601`
-for older Rubies.
+itself still uses the real gem in Discourse); without it a bare Ruby stops
+with `LoadError: cannot load such file -- digest/keccak`. `-rtime` loads
+`Time.iso8601` for older Rubies.
 
 ### Integration tests (require an Ethereum RPC endpoint)
 
 ```bash
-ruby test/ens_integration_test.rb
-ruby test/society_integration_test.rb
+ruby -r./test/support/pure_keccak -rtime test/ens_integration_test.rb
+ruby -r./test/support/pure_keccak -rtime test/society_integration_test.rb
 ```
 
 By default, integration tests use a public RPC. Set `RPC_URL` for a dedicated
 provider:
 
 ```bash
-RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY ruby test/society_integration_test.rb
+RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY \
+  ruby -r./test/support/pure_keccak -rtime test/society_integration_test.rb
 ```
 
 To test the positive Society resolution path, set an address that holds a
@@ -349,13 +351,13 @@ profile badge:
 ```bash
 RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY \
 SOCIETY_ADDRESS=0x... \
-ruby test/society_integration_test.rb
+  ruby -r./test/support/pure_keccak -rtime test/society_integration_test.rb
 ```
 
-### Run all tests
+### Run all unit tests
 
 ```bash
-for f in test/*_test.rb; do ruby "$f"; done
+for f in test/*_unit_test.rb; do ruby -r./test/support/pure_keccak -rtime "$f"; done
 ```
 
 ## How it works
