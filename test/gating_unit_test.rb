@@ -174,6 +174,17 @@ class GatingPlannerTest < Minitest::Test
     assert_equal [:set_permissions], plan.actions.map(&:type)
   end
 
+  def test_an_existing_group_spelled_in_another_case_is_not_drift
+    cfg = config
+    state = converged_state(cfg)
+    perms = state[:categories]['governors-only'][:permissions]
+    perms['Governors'] = perms.delete('governors')
+    assert_empty Plan.plan(cfg, state).actions
+
+    perms['Governors'] = :readonly
+    assert_equal [:set_permissions], Plan.plan(cfg, state).actions.map(&:type)
+  end
+
   def test_a_stray_extra_group_on_a_gated_category_is_removed
     cfg = config
     state = converged_state(cfg)
