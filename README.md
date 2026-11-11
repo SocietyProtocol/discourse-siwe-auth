@@ -237,28 +237,36 @@ suite.
 ### Unit tests (no network needed)
 
 ```bash
-ruby test/ens_unit_test.rb
-ruby test/society_unit_test.rb
-ruby test/light_account_unit_test.rb
+ruby -r./test/support/pure_keccak -rtime test/ens_unit_test.rb
+ruby -r./test/support/pure_keccak -rtime test/society_unit_test.rb
+ruby -r./test/support/pure_keccak -rtime test/light_account_unit_test.rb
+ruby -r./test/support/pure_keccak -rtime test/smart_account_transfer_unit_test.rb
 ```
 
+`test/support/pure_keccak.rb` uses the `keccak` gem when it is installed and a
+pure-Ruby Keccak-256 (`test/support/lib/`) otherwise, so the scripts run on a
+bare Ruby. `-rtime` loads `Time.iso8601` for older Rubies.
+
 `test/light_account_unit_test.rb` checks the Light Account derivation against
-every pair in `script/forum-address-map.json` and the rewrite planner. Without
-the `keccak` gem it falls back to a pure-Ruby Keccak (`test/support/`); the
-other scripts can use it too: `ruby -rtime -r ./test/support/pure_keccak test/society_unit_test.rb`.
+every pair in `script/forum-address-map.json` and the rewrite planner.
+`test/smart_account_transfer_unit_test.rb` runs the whole transfer (plan,
+backup, writes, merges, usernames, verification, re-runs after a failure)
+against an in-memory forum; see
+[Transferring users to smart accounts](#transferring-users-to-smart-accounts).
 
 ### Integration tests (require an Ethereum RPC endpoint)
 
 ```bash
-ruby test/ens_integration_test.rb
-ruby test/society_integration_test.rb
+ruby -r./test/support/pure_keccak -rtime test/ens_integration_test.rb
+ruby -r./test/support/pure_keccak -rtime test/society_integration_test.rb
 ```
 
 By default, integration tests use a public RPC. Set `RPC_URL` for a dedicated
 provider:
 
 ```bash
-RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY ruby test/society_integration_test.rb
+RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY \
+  ruby -r./test/support/pure_keccak -rtime test/society_integration_test.rb
 ```
 
 To test the positive Society resolution path, set an address that holds a
@@ -267,13 +275,13 @@ profile badge:
 ```bash
 RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY \
 SOCIETY_ADDRESS=0x... \
-ruby test/society_integration_test.rb
+  ruby -r./test/support/pure_keccak -rtime test/society_integration_test.rb
 ```
 
-### Run all tests
+### Run all unit tests
 
 ```bash
-for f in test/*_test.rb; do ruby "$f"; done
+for f in test/*_unit_test.rb; do ruby -r./test/support/pure_keccak -rtime "$f"; done
 ```
 
 ## How it works
@@ -341,144 +349,225 @@ The task resolves ENS and Society identities, sets the default preference, and
 stores the result in user custom fields. Existing display names are left
 untouched unless the user toggles their preferred identity.
 
-### Moving forum users to Light Accounts
+### Transferring users to smart accounts
 
 Members sign in as their Light Account `S` (owned by their wallet `E`), not
-as `E`. The SIWE `uid` is always the EIP-55 checksummed address, and Discourse
-matches it exactly. Existing users must be moved from `E` to `S` **before**
-the Light Account login goes live, otherwise their next sign-in creates a new,
-empty forum user for `S`. That login is in every build of this branch from
-`8a4f838` on, not only the final one: check step 0 before assuming it has not
-shipped.
+as `E`. The SIWE `uid` is the EIP-55 checksummed address and Discourse matches
+it exactly, so a forum user who was created for `E` has to be transferred to
+`S`. Otherwise the same wallet's next sign-in creates a new, empty user.
 
-`script/rewrite_smart_account_users.rb` covers every `siwe` account on the
-forum (not only Outpost members). For each one it derives `S` in Ruby, then:
-
-- sets `provider_uid` to checksummed `S`;
-- sets the `wallet_address` custom field to `S` and `siwe_owner_address` to `E`;
-- renames what the login derived from `E` to what a fresh Light Account login
-  would get:
-  - a display name that is `E` in full (any case) becomes checksummed `S`, or
-    `S`'s short form when **siwe society enabled** is on (new users get the
-    short form there);
-  - a wallet-style display name (`0x9ba7…7c3c`) becomes `S`'s short form;
-  - a username Discourse cut from `E` (`0x` plus at least 8 hex digits that
-    are a prefix of `E`) becomes the username Discourse suggests for `S`,
-    through `UsernameChanger`, so mentions and quotes follow. Pass
-    `KEEP_USERNAMES=1` to leave usernames alone;
-  - `nickname` / `name` in the account's `info` when they held `E`.
-
-  Any other value is kept: a name the user chose, a Society or ENS name, or
-  another wallet's address. Rows an earlier run already moved (`already`,
-  `adopt`, `recase`) are checked as well, so re-running the script fixes
-  names that an older version left on `E`. The dry run prints every rename
-  under `RENAMES`.
-
-It refuses to run unless its derivation matches every pair in
-`script/forum-address-map.json` (flat or chain-keyed). It skips rows that are
-already Light Accounts (re-runs are no-ops), contract wallets (`eth_getCode`),
-and, with `SUSPECT_AFTER`, rows created after a given time. A row whose uid is
-a Light Account from the map is never rewritten, even with no
-`siwe_owner_address`: it is `adopt` (records `E`) or `recase` (fixes the case
-and records `E`). A uid that is not checksummed and is not in the map is left
-as `review`, since only a script or a hand edit writes another case. If someone
-already signed in as `S` (a duplicate user), it changes neither row and
-prints both user ids and usernames; merge them in the admin UI, or pass
-`MERGE_DUPLICATES=1` to merge the newer user into the original with
-Discourse's `UserMerger`. Writes happen in one transaction.
-
-Do staging (Sepolia) first, then production (mainnet). Light Account
-addresses are the same on both chains; `RPC_URL` only feeds the contract
-wallet check and should point at the forum's chain.
-
-0. Find out whether the forum ever ran a build with the Light Account login
-   (`8a4f838` or later; check the plugin commit in the admin panel or in
-   `app.yml` and the rebuild history). If it did, users who signed in since
-   then are rows for `S` with no recorded owner, and an `S` missing from the
-   map would be rewritten to the Light Account of `S`. Set `SUSPECT_AFTER` to
-   that first deploy time (ISO 8601) in steps 3 and 5. If it never did, pass
-   `NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1` with `APPLY=1` instead; the script
-   refuses to apply with neither.
-
-1. Put the new plugin checkout where the container can read it, without
-   rebuilding yet:
-
-   ```bash
-   cd /var/discourse
-   git clone -b smart-account-login https://github.com/SocietyProtocol/discourse-siwe-auth.git \
-     shared/standalone/tmp/discourse-siwe-auth
-   ./launcher enter app
-   cd /var/www/discourse
-   ```
-
-2. Back up what the rewrite touches (needed for rollback):
-
-   ```bash
-   sudo -u postgres psql discourse -c "
-     CREATE TABLE siwe_backup_accounts AS
-       SELECT * FROM user_associated_accounts WHERE provider_name = 'siwe';
-     CREATE TABLE siwe_backup_fields AS
-       SELECT * FROM user_custom_fields
-       WHERE name IN ('wallet_address', 'siwe_owner_address');
-     CREATE TABLE siwe_backup_names AS
-       SELECT id, name, username FROM users
-       WHERE id IN (SELECT user_id FROM siwe_backup_accounts);"
-   ```
-
-   With `MERGE_DUPLICATES=1`, also take a full backup (`discourse backup`):
-   merges cannot be undone from these tables.
-
-3. Dry run, and read the table (`rewrite`, `duplicate`, `adopt`, `review`,
-   `contract`, ...):
-
-   ```bash
-   RPC_URL=https://ethereum-rpc.publicnode.com \
-   SUSPECT_AFTER=2026-10-15T16:00:00Z \
-     sudo -E -u discourse bundle exec rails runner \
-     /shared/tmp/discourse-siwe-auth/script/rewrite_smart_account_users.rb
-   ```
-
-   (`SUSPECT_AFTER` per step 0; the value above is an example.) No
-   `rewrite` row may have a `from` that is a known Light Account (the
-   script aborts if one does). Check every `review` row by hand: compare
-   its `from` with the map and the user's history before changing it.
-   Read the `RENAMES` list under the table too: each line is one display
-   name, username or `info` value that still holds the old address and the
-   value it will get.
-
-4. Turn off **Discourse siwe enabled**, so nobody signs in with the old page
-   between the rewrite and the rebuild.
-
-5. Apply (same command with `APPLY=1`, the same `SUSPECT_AFTER` or
-   `NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1`, plus `MERGE_DUPLICATES=1` if wanted).
-   Re-run the dry run: every row should now be `already`, apart from the
-   `review` rows you chose to leave, and `RENAMES` should say `none`.
-
-6. Deploy the plugin (new `siwe.iife.js`, strategy and lookups):
-   `./launcher rebuild app`. Turn **Discourse siwe enabled** back on and sign
-   in once with a migrated wallet: it must land on the existing user.
-
-Rollback (before any merge): turn off **Discourse siwe enabled**, restore the
-backup, then rebuild with the previous plugin commit.
+The transfer does that for every `siwe` account on the forum (not only
+Outpost members). After it, a member who signs in with the same wallet lands
+on their original user, with all of its posts, likes, groups, badges,
+notifications and settings. It is one tool with two entry points:
 
 ```bash
-sudo -u postgres psql discourse -c "
-  UPDATE user_associated_accounts a SET provider_uid = b.provider_uid, info = b.info
-    FROM siwe_backup_accounts b WHERE a.id = b.id;
-  DELETE FROM user_custom_fields WHERE name = 'siwe_owner_address'
-    AND id NOT IN (SELECT id FROM siwe_backup_fields);
-  UPDATE user_custom_fields f SET value = b.value
-    FROM siwe_backup_fields b WHERE f.id = b.id;
-  UPDATE users u SET name = b.name FROM siwe_backup_names b WHERE u.id = b.id;"
+# the forum already runs this plugin version
+rake siwe:smart_accounts:transfer            # dry run: prints the plan, writes nothing
+rake 'siwe:smart_accounts:transfer[apply]'   # backup, write, verify
+rake siwe:smart_accounts:verify              # read-only check, exit 1 on failure
+
+# the forum still runs an older version: same code, loaded from a checkout
+rails runner /path/discourse-siwe-auth/script/rewrite_smart_account_users.rb            # dry run
+APPLY=1 rails runner /path/discourse-siwe-auth/script/rewrite_smart_account_users.rb
+VERIFY=1 rails runner /path/discourse-siwe-auth/script/rewrite_smart_account_users.rb
 ```
 
-Usernames the script renamed are not restored by this SQL (a username change
-also rewrites mentions and quotes). Put one back from the Rails console with
-`UsernameChanger.change(user, old_username, Discourse.system_user)`, using the
-`username` column of `siwe_backup_names`.
+#### What it moves
 
-Users who signed in as `S` after the deploy and have no row in the backup keep
-their `S` account. Drop the `siwe_backup_*` tables once the switch is settled.
+For each account it derives `S = LightAccountFactory.getAddress(E, 0)` in Ruby
+and writes only what is still different:
+
+| What | Where | After the transfer |
+| --- | --- | --- |
+| Sign-in identity | `user_associated_accounts.provider_uid` | checksummed `S` |
+| Wallet | `wallet_address` custom field | `S`, lowercase (what the login writes) |
+| Owner | `siwe_owner_address` custom field | `E`, lowercase |
+| Display name | `users.name` | `E` in full (any case) becomes checksummed `S`, or `S`'s short form when **siwe society enabled** is on; a wallet-style name (`0x9ba7…7c3c`) becomes `S`'s short form |
+| Username | `users.username` | a username Discourse cut from `E` (`0x` plus at least 8 hex digits that are a prefix of `E`) becomes the one Discourse suggests for `S`, through `UsernameChanger`, so mentions and quotes follow. `KEEP_USERNAMES=1` leaves usernames alone |
+| Account info | `nickname` / `name` in the row's `info` json | `S` when they held `E` |
+| Society cache | `society_resolved_at` custom field | deleted for accounts moved in this run, so the next sign-in looks the profile up again for `S` (with `E` as fallback) |
+| A duplicate user | a second user who already signed in as `S` | merged into the original with Discourse's `UserMerger` (`MERGE_DUPLICATES=1`): posts, likes, groups, badges, notifications, bookmarks and emails end on one user |
+| A leftover row | a `siwe` row for `S` with no user | deleted, because it blocks the unique index. `UserMerger` leaves such a row when both merged users had a `siwe` row, for example after a merge in the admin UI |
+
+Accounts that an earlier run already moved (`already`, `adopt`, `recase`) are
+checked for the same fields, so a re-run finishes whatever an older version or
+a failed run left on `E`.
+
+It deliberately leaves:
+
+- a name the user chose, a Society or ENS name, another wallet's address;
+- `ens_name`, `ens_avatar`, the `society_*` values and `preferred_identity`:
+  they are names and pictures, not addresses, and the login resolves them for
+  `S` with `E` as fallback. Avatars need nothing: letter avatars follow the
+  username, uploaded ones belong to the user;
+- contract wallets (`contract`), rows whose uid is not an address (`invalid`),
+  rows with no user (`orphan`) and deployed Light Accounts whose owner is not
+  known yet (`light_account`; recorded at their next sign-in). These are the
+  recognised skips.
+
+#### How it decides
+
+The dry run prints one line per `siwe` row with a status:
+
+| Status | Meaning | Written |
+| --- | --- | --- |
+| `rewrite` | uid is an EOA | everything above |
+| `duplicate` | uid is an EOA and another user already signed in as its `S` | with `MERGE_DUPLICATES=1`: the newer user is merged into the older one, then as `rewrite`. Without it: nothing, and verification fails |
+| `smart_of` | the `S` row of such a pair, owner not recorded | handled with its `duplicate` |
+| `already` | uid is `S` and `siwe_owner_address` proves it | only fields or names that are still off |
+| `adopt` | uid is `S`; the owner is proven by the row's sign-in record (`extra.owner_address`), the address map, or an orphan row for `E` | the owner, plus fields and names |
+| `recase` | as above, but the uid is not checksummed | the checksummed uid as well |
+| `review` | a uid in another case that is not in the map, or (with `SUSPECT_AFTER`) a row created after that time with no proof of its owner | nothing; verification fails until you list the row id in `REVIEWED_ROWS` |
+| `unknown_code` | `eth_getCode` failed | nothing; verification fails, run again |
+| `contract`, `invalid`, `orphan`, `light_account` | recognised skips | nothing |
+
+An owner is only ever accepted when CREATE2 binds it to the uid, so a wrong
+custom field or map entry cannot move an account. The tool refuses to run
+unless its derivation matches every pair in `script/forum-address-map.json`
+(flat or chain-keyed).
+
+#### Safety
+
+- **Dry run by default.** It prints the table, a per-user plan (every value
+  with its old and new content), a summary, and what verification would say
+  after an apply.
+- **Backup first.** An apply that has something to write starts by copying,
+  inside the same transaction, every `siwe` row
+  (`siwe_backup_<run>_accounts`), every custom field of the users behind them
+  (`siwe_backup_<run>_fields`) and their id, username, name and creation time
+  (`siwe_backup_<run>_users`). `<run>` is the UTC start time
+  (`20261111153000`). When users are merged it also copies their group
+  memberships and badges (`siwe_backup_<run>_group_users`,
+  `siwe_backup_<run>_user_badges`) as a record of who had what.
+- **Transactions.** The backup and every account that is not part of a merge
+  are one transaction: if anything fails, nothing is written and no backup
+  table is left. A merge cannot be part of it: `UserMerger` is run the way
+  Discourse runs it, outside a wrapping transaction (it moves posts topic by
+  topic and deletes a user). Each merge is followed by one transaction for the
+  surviving account. Usernames change last, through `UsernameChanger`, which
+  rewrites mentions in a background job.
+- **Idempotent.** Every step writes only what is still different. A second
+  apply writes nothing and takes no backup. After a failure, run the same
+  command again: it continues where it stopped, also after a merge that died
+  half way (the detached `S` row is replaced). If `UserMerger` died before it
+  deleted the duplicate, that user still exists without a wallet: merge it
+  again from its admin page.
+- **Verification.** An apply ends by planning again from the database. It
+  exits 1, with `VERIFICATION FAILED` and one `UNRESOLVED` line per account,
+  if any `siwe` account is still on an old wallet without being a recognised
+  skip, or still has a value to write. `rake siwe:smart_accounts:verify` runs
+  only this check.
+
+#### Options (environment variables)
+
+| Variable | Effect |
+| --- | --- |
+| `MERGE_DUPLICATES=1` | merge duplicate users. The older user (by creation time, then id) survives. A survivor whose username was cut from `E` gets the plain username for `S`, also when its duplicate held that name |
+| `FULL_BACKUP_TAKEN=1` | confirms a full backup exists; an apply that would merge is refused without it |
+| `SUSPECT_AFTER=<ISO time>` | rows created later with no proof of their owner are left as `review`. Set it to the first deploy of a build with the Light Account login (`8a4f838` or later): `8a4f838` signed in as `S` without recording the owner, and an `S` that is not in the map would otherwise be taken for an EOA and moved to the Light Account of `S` |
+| `NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1` | instead of `SUSPECT_AFTER`: nobody ever signed in through such a build here. An apply is refused with neither |
+| `REVIEWED_ROWS=12,15` | `review` rows you checked and accept as they are |
+| `KEEP_USERNAMES=1` | do not rename usernames |
+| `RPC_URL=<json-rpc>` | used only to tell contract wallets from EOAs (`eth_getCode`); default **siwe ethereum rpc url**. It is never printed |
+| `SKIP_CODE_CHECK=1` | run without an RPC; contract wallets would be rewritten too |
+| `FORUM_ADDRESS_MAP=<path>` | another address map for the self-test |
+
+#### Production procedure
+
+Do staging first, then production. Light Account addresses are the same on
+every chain. Run the commands in the Discourse container, in
+`/var/www/discourse`, as the `discourse` user (`sudo -E -u discourse bundle
+exec ...`). A rake or runner process needs about 1 GB on top of the running
+app: raise the container's memory limit first if it has one.
+
+1. **Stop wallet sign-ins.** Turn off **Discourse siwe enabled** (if an
+   environment variable sets it, change the variable). Existing sessions keep
+   working; nobody can create a duplicate user while you work.
+2. **Deploy this plugin version** (rebuild or roll out the image). Sign-ins
+   stay off. If you cannot deploy first, clone the plugin where the container
+   can read it and use the script instead of the rake task in the steps below.
+3. **Take a full backup** (`discourse backup`, or the admin Backups page) and
+   keep it. It is the only way back from a merge.
+4. **Dry run** and read all of it:
+
+   ```bash
+   sudo -E -u discourse bundle exec rake siwe:smart_accounts:transfer
+   ```
+
+   Add `MERGE_DUPLICATES=1` if the table has `duplicate` rows. No `rewrite`
+   row may have a `from` that is a Light Account (the tool aborts if it is one
+   from the map). Check each `review` row by hand: compare its `from` with the
+   map and the user's history, then either fix it or list its id in
+   `REVIEWED_ROWS`. `AFTER AN APPLY` must end with `0 unresolved`.
+5. **Apply**, with the options of the dry run plus the confirmations:
+
+   ```bash
+   NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1 \
+     sudo -E -u discourse bundle exec rake 'siwe:smart_accounts:transfer[apply]'
+   ```
+
+   Use `SUSPECT_AFTER=<first deploy time>` instead of
+   `NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1` if members could already sign in through
+   the Light Account login (a staging forum, or a production forum where step
+   1 was skipped), and add `MERGE_DUPLICATES=1 FULL_BACKUP_TAKEN=1` to merge.
+   It must end with `VERIFICATION: ... 0 unresolved` and exit 0. Note the
+   backup run id it prints.
+6. **Check.** `rake siwe:smart_accounts:verify` exits 0, and a second dry run
+   says `PLAN: nothing to write.`
+7. **Turn Discourse siwe enabled back on** and sign in once with a
+   transferred wallet: it must land on the existing user, with its posts.
+8. Drop the `siwe_backup_<run>_*` tables once the switch is settled.
+
+#### Rollback
+
+Turn off **Discourse siwe enabled** first, and roll the plugin back to the
+previous version afterwards.
+
+*No merge happened.* Run the SQL the apply printed (it is also what
+`DiscourseSiwe::SmartAccountRewrite.restore_sql('<run>')` returns):
+
+```bash
+sudo -u postgres psql discourse <<'SQL'
+BEGIN;
+UPDATE user_associated_accounts a SET provider_uid = b.provider_uid, info = b.info
+  FROM siwe_backup_<run>_accounts b WHERE a.id = b.id;
+DELETE FROM user_custom_fields f USING siwe_backup_<run>_users u
+  WHERE f.user_id = u.id AND f.name IN ('wallet_address', 'siwe_owner_address', 'society_resolved_at');
+INSERT INTO user_custom_fields (user_id, name, value, created_at, updated_at)
+  SELECT b.user_id, b.name, b.value, b.created_at, b.updated_at
+  FROM siwe_backup_<run>_fields b JOIN users u ON u.id = b.user_id
+  WHERE b.name IN ('wallet_address', 'siwe_owner_address', 'society_resolved_at');
+UPDATE users u SET name = b.name FROM siwe_backup_<run>_users b WHERE u.id = b.id;
+COMMIT;
+SQL
+```
+
+Then put the usernames back, which also rewrites mentions and quotes:
+
+```bash
+sudo -E -u discourse bundle exec rails runner '
+  DB.query("SELECT id, username FROM siwe_backup_<run>_users").each do |b|
+    user = User.find_by(id: b.id)
+    next if user.nil? || user.username == b.username
+    UsernameChanger.change(user, b.username, Discourse.system_user)
+  end'
+```
+
+What this restore does and does not undo:
+
+- It restores `provider_uid` and `info` of every `siwe` row that still exists,
+  the three custom fields the transfer writes, and display names; the runner
+  line restores usernames.
+- It does **not** undo a merge. The merged user is deleted and its posts,
+  likes, groups and badges are on the survivor; no table here can split them
+  again. After a merge the SQL above still puts the survivor back on `E`, but
+  nobody is left on `S`. The only full undo of a merge is restoring the full
+  backup from step 3, which also loses everything posted since.
+- It does not bring back a deleted `siwe` row (an orphan row, or a merged
+  user's row). Nothing depends on them.
+- Users who signed in as `S` after the transfer and are not in the backup keep
+  their `S` account.
 
 ## Troubleshooting and engineering notes
 
