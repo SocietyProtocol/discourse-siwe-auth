@@ -210,7 +210,6 @@ categories:
 * Restricting a category that is public today is **blocked** until `confirm_restrict: true` is set, so it cannot happen by accident.
 * `siwe:gating:status` shows drift between the YAML and the forum and what the badge sync would add or remove.
 * `siwe:gating:audit` is the mandatory check before restricting anything. It lists members of a gated group who hold no badge (they would lose access), members with no wallet (they would keep access forever), and gated groups no badge feeds. It exits non-zero until each item is resolved: remove them, grandfather them with `siwe_group_sync_exempt_usernames`, or give them the badge.
-* If Fritz edits a gated category's permissions in the admin UI, `status` reports it as drift and `provision[apply]` puts it back. The YAML wins.
 * If an admin edits a gated category's permissions in the admin UI, `status` reports it as drift and `provision[apply]` puts it back. The YAML wins.
 * Group lists and flair reveal who holds a badge by wallet. Choose each group's `visibility` accordingly.
 
