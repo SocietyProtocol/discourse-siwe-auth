@@ -322,6 +322,7 @@ ruby -r./test/support/pure_keccak -rtime test/society_unit_test.rb
 ruby -r./test/support/pure_keccak -rtime test/society_lookup_unit_test.rb
 ruby -r./test/support/pure_keccak -rtime test/light_account_unit_test.rb
 ruby -r./test/support/pure_keccak -rtime test/smart_account_transfer_unit_test.rb
+ruby -r./test/support/pure_keccak -rtime test/smart_account_sync_state_unit_test.rb
 ruby -r./test/support/pure_keccak -rtime test/group_sync_unit_test.rb
 ruby -r./test/support/pure_keccak -rtime test/gating_unit_test.rb
 ruby -r./test/support/pure_keccak -rtime test/badge_mirror_unit_test.rb
@@ -476,6 +477,8 @@ and writes only what is still different:
 | Society cache | `society_resolved_at` custom field | deleted for accounts moved in this run, so the next sign-in looks the profile up again for `S` (with `E` as fallback) |
 | A duplicate user | a second user who already signed in as `S` | merged into the original with Discourse's `UserMerger` (`MERGE_DUPLICATES=1`): posts, likes, groups, badges, notifications, bookmarks and emails end on one user |
 | A leftover row | a `siwe` row for `S` with no user | deleted, because it blocks the unique index. `UserMerger` leaves such a row when both merged users had a `siwe` row, for example after a merge in the admin UI |
+| Sync counters | plugin store rows `group_sync_pending` and `badge_mirror_pending` (how many runs a user was seen without a badge) | dropped for the users moved or merged in this run, so nobody leaves a group or loses a mirrored badge on counts gathered for the old address: the full number of confirmations applies again |
+| Badge sync debounce | `siwe_badges_synced_at` custom field | deleted for the same users: their next sign-in mirrors badges at once |
 
 Accounts that an earlier run already moved (`already`, `adopt`, `recase`) are
 checked for the same fields, so a re-run finishes whatever an older version or
@@ -488,6 +491,12 @@ It deliberately leaves:
   they are names and pictures, not addresses, and the login resolves them for
   `S` with `E` as fallback. Avatars need nothing: letter avatars follow the
   username, uploaded ones belong to the user;
+- group memberships and mirrored badges: they are keyed by user id and follow
+  a merge through `UserMerger`. The group sync and the badge mirror judge a
+  member by `wallet_address`, `siwe_owner_address` and the address map, so a
+  badge that is still on `E` keeps counting after the transfer. The badge
+  records (`badge_mirror:token:<id>`), the mirror's meta and hold rows and the
+  last reports hold no member address;
 - contract wallets (`contract`), rows whose uid is not an address (`invalid`),
   rows with no user (`orphan`) and deployed Light Accounts whose owner is not
   known yet (`light_account`; recorded at their next sign-in). These are the
@@ -526,7 +535,8 @@ unless its derivation matches every pair in `script/forum-address-map.json`
   (`siwe_backup_<run>_users`). `<run>` is the UTC start time
   (`20261111153000`). When users are merged it also copies their group
   memberships and badges (`siwe_backup_<run>_group_users`,
-  `siwe_backup_<run>_user_badges`) as a record of who had what.
+  `siwe_backup_<run>_user_badges`) as a record of who had what. The two
+  counter rows of the plugin store go to `siwe_backup_<run>_plugin_store`.
 - **Transactions.** The backup and every account that is not part of a merge
   are one transaction: if anything fails, nothing is written and no backup
   table is left. A merge cannot be part of it: `UserMerger` is run the way
@@ -570,7 +580,9 @@ app: raise the container's memory limit first if it has one.
 
 1. **Stop wallet sign-ins.** Turn off **Discourse siwe enabled** (if an
    environment variable sets it, change the variable). Existing sessions keep
-   working; nobody can create a duplicate user while you work.
+   working; nobody can create a duplicate user while you work. The hourly
+   badge mirror pauses while the setting is off and the group sync keeps
+   running; neither has to be stopped for the transfer.
 2. **Deploy this plugin version** (rebuild or roll out the image). Sign-ins
    stay off. If you cannot deploy first, clone the plugin where the container
    can read it and use the script instead of the rake task in the steps below.
@@ -653,6 +665,8 @@ What this restore does and does not undo:
   backup from step 3, which also loses everything posted since.
 - It does not bring back a deleted `siwe` row (an orphan row, or a merged
   user's row). Nothing depends on them.
+- It does not put the dropped sync counters or the badge debounce back. They
+  rebuild on the next runs, and a missing counter can only delay a removal.
 - Users who signed in as `S` after the transfer and are not in the backup keep
   their `S` account.
 

@@ -4,6 +4,7 @@ require 'json'
 require 'time'
 require_relative 'smart_account_rewrite'
 require_relative 'smart_account_transfer'
+require_relative 'smart_account_sync_state'
 
 module DiscourseSiwe
   # Wires SmartAccountTransfer to real Discourse. Every decision lives in
@@ -113,7 +114,8 @@ module DiscourseSiwe
       # CREATE TABLE ... AS on the ActiveRecord connection, so the copies are
       # part of the surrounding transaction.
       def backup(run, merge_user_ids:)
-        tables = SmartAccountRewrite.backup_tables(run, merge_user_ids: merge_user_ids)
+        tables = SmartAccountRewrite.backup_tables(run, merge_user_ids: merge_user_ids) +
+                 SmartAccountSyncState.backup_tables(run)
         tables.each { |name, select| ActiveRecord::Base.connection.execute("CREATE TABLE #{name} AS #{select}") }
         tables.map(&:first)
       end
@@ -172,6 +174,11 @@ module DiscourseSiwe
 
       def merge_users(loser_id, survivor_id)
         UserMerger.new(User.find(loser_id), User.find(survivor_id), Discourse.system_user).merge!
+      end
+
+      # Group sync and badge mirror state of the transferred users.
+      def after_transfer(moved_user_ids:, merged:)
+        SmartAccountSyncState.apply(moved_user_ids: moved_user_ids, merged: merged)
       end
     end
   end
