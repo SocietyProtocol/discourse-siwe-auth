@@ -6,6 +6,7 @@
 #   rake siwe:smart_accounts:transfer          dry run: plan, nothing written
 #   rake 'siwe:smart_accounts:transfer[apply]' backup, write, verify
 #   rake siwe:smart_accounts:verify            read-only check, exit 1 on failure
+#   rake 'siwe:smart_accounts:restore_sql[<run>]'  print the rollback SQL of a backup run
 #
 # Options are environment variables (the same ones the script takes):
 #   MERGE_DUPLICATES=1, FULL_BACKUP_TAKEN=1, SUSPECT_AFTER=<ISO time>,
@@ -44,6 +45,12 @@ namespace :siwe do
     desc 'Check that every siwe user is on a Light Account or a recognised skip (read-only)'
     task verify: :environment do
       ok = load_runner.call.run(env: ENV, verify_only: true)
+      exit 1 unless ok
+    end
+
+    desc 'Print the rollback SQL of a backup run: siwe:smart_accounts:restore_sql[20261111153000] (read-only)'
+    task :restore_sql, [:run] => :environment do |_t, args|
+      ok = load_runner.call.restore_sql(args[:run])
       exit 1 unless ok
     end
   end

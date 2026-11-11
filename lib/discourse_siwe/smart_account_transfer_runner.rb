@@ -35,6 +35,23 @@ module DiscourseSiwe
       (verify_only ? transfer.verify : transfer.run)[:ok]
     end
 
+    # Prints the restore SQL of one backup run (README "Rollback"), for an
+    # operator who no longer has the output of the apply. Read-only. Returns
+    # false, with the runs that do exist, when `run` has no complete backup.
+    def restore_sql(run, out: ->(line) { puts line }, store: nil)
+      run = run.to_s.strip
+      runs = Array((store || Store.new).backup_runs)
+      unless runs.include?(run)
+        out.call("No complete backup for run #{run.inspect} (it needs siwe_backup_<run>_accounts, _fields and _users).")
+        out.call(runs.empty? ? 'No siwe_backup_* set exists in this database.' : "Backups here, oldest first: #{runs.join(', ')}")
+        return false
+      end
+
+      SmartAccountRewrite.restore_sql(run).each_line { |line| out.call(line.chomp) }
+      out.call("-- oldest backup here: #{runs.first}. The rollback point of a transfer is its first apply.") if runs.first != run
+      true
+    end
+
     def build(env, apply, out, store, short_name)
       map_path = env['FORUM_ADDRESS_MAP'].to_s.strip.empty? ? DEFAULT_MAP : env['FORUM_ADDRESS_MAP']
       pairs = SmartAccountRewrite.address_pairs(JSON.parse(File.read(map_path)))

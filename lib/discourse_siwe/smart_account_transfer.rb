@@ -114,6 +114,7 @@ module DiscourseSiwe
     def verify
       say "self-test: #{REWRITE.self_test!(@pairs)} address map pairs match the Light Account derivation"
       verification = verify_now(table: true)
+      print_plan_options
       result(verification[:ok] ? :verified : :verification_failed, verification[:ok], verification)
     end
 
