@@ -15,6 +15,7 @@ module DiscourseSiwe
   #   store.suggest_username(checksummed_smart, free_username) -> username
   #   store.transaction { }
   #   store.backup(run_id, merge_user_ids:) -> [table names]
+  #   store.backup_runs -> [run ids of earlier backups, oldest first]  (optional)
   #   store.delete_account(id)        store.set_uid(id, uid)
   #   store.set_info(id, { 'nickname' => .., 'name' => .. })
   #   store.set_fields(user_id, { 'wallet_address' => .., .. })
@@ -80,6 +81,12 @@ module DiscourseSiwe
       print_verification(projected, applied: false, transfers: transfers)
 
       unless @apply
+        if @suspect_after.nil? && !@no_login_deployed
+          say "\nNOTE: an apply needs SUSPECT_AFTER or NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1. SUSPECT_AFTER changes " \
+              'the plan (later rows with no proof of their owner become review): if you will apply with it, ' \
+              'dry-run with it.'
+        end
+        print_plan_options
         say "\nDRY RUN: nothing written."
         return result(:dry_run, true, projected)
       end
@@ -94,6 +101,7 @@ module DiscourseSiwe
       end
 
       verification = verify_now
+      print_plan_options
       status = verification[:ok] ? :applied : :verification_failed
       result(status, verification[:ok], verification, tables)
     rescue Refused => e
@@ -140,11 +148,15 @@ module DiscourseSiwe
       [plan, transfers]
     end
 
-    # Known Light Accounts are planned as already/adopt/recase; this must hold.
+    # Known Light Accounts are planned as already/adopt/recase, or as a
+    # duplicate that stays on the same address; this must hold.
     def guard_known_light_accounts!(plan)
       known = {}
       @pairs.each { |_, smart| known[smart.to_s.downcase] = true }
-      bad = plan.select { |p| %i[rewrite duplicate].include?(p[:status]) && known[p[:from].to_s.downcase] }
+      bad = plan.select do |p|
+        %i[rewrite duplicate].include?(p[:status]) && known[p[:from].to_s.downcase] &&
+          !LightAccount.same_address?(p[:from], p[:to])
+      end
       raise "BUG: would rewrite known Light Accounts #{bad.map { |p| p[:from] }.join(', ')}" if bad.any?
     end
 
@@ -169,6 +181,7 @@ module DiscourseSiwe
       merges = todo.select { |t| t[:merge] }
       plain = todo - merges
       tables = nil
+      @earlier_runs = @store.respond_to?(:backup_runs) ? Array(@store.backup_runs) - [@run_id] : []
 
       say "\nAPPLYING (backup run #{@run_id})"
       begin
@@ -183,6 +196,7 @@ module DiscourseSiwe
         raise
       end
       say "backup: #{tables.join(', ')}"
+      print_earlier_runs
 
       # The store hook also runs for what was written before a failure.
       written = plain.dup
@@ -205,7 +219,9 @@ module DiscourseSiwe
       rescue StandardError
         say "FAILED merging user #{loser[:user_id]} (#{loser[:username]}) into #{transfer[:user_id]} " \
             "(#{transfer[:username]}). Accounts listed before it are written; this pair is not. " \
-            'Fix the cause and run the same command again.'
+            'Fix the cause and run the same command again. If the merge stopped half way, user ' \
+            "#{loser[:user_id]} can be left without a wallet, where no later run or verification sees it: " \
+            "if it still exists after the re-run, merge it into user #{transfer[:user_id]} from its admin page."
         raise
       end
       @counts[:merged] += 1
@@ -223,6 +239,10 @@ module DiscourseSiwe
     def write(transfer)
       if transfer[:delete]
         @store.delete_account(transfer[:delete])
+        @counts[:rows_deleted] += 1
+      end
+      if transfer[:delete_orphan]
+        @store.delete_account(transfer[:delete_orphan])
         @counts[:rows_deleted] += 1
       end
       if transfer[:uid]
@@ -328,6 +348,7 @@ module DiscourseSiwe
         if t[:delete]
           say "  delete siwe row     #{t[:delete]}#{t[:merge] ? ' (the merged user\'s account)' : ' (no user)'}"
         end
+        say "  delete siwe row     #{t[:delete_orphan]} (no user)" if t[:delete_orphan]
         say "  provider_uid        #{t[:uid][:from]} -> #{t[:uid][:to]}" if t[:uid]
         (t[:fields] + t[:renames]).each do |c|
           say "  #{c[:field].to_s.ljust(19)} #{c[:from].nil? ? '(none)' : c[:from]} -> #{c[:to]}"
@@ -342,7 +363,8 @@ module DiscourseSiwe
       "#{todo.size} users change: #{todo.count { |t| t[:uid] }} provider_uid, " \
         "#{todo.sum { |t| t[:fields].size }} custom fields, #{count.call(:name)} display names, " \
         "#{count.call(:username)} usernames, #{count.call(:info_nickname) + count.call(:info_name)} info values, " \
-        "#{todo.count { |t| t[:merge] }} merges, #{todo.count { |t| t[:delete] && !t[:merge] }} orphan rows replaced"
+        "#{todo.count { |t| t[:merge] }} merges, " \
+        "#{todo.count { |t| t[:delete] && !t[:merge] } + todo.count { |t| t[:delete_orphan] }} orphan rows replaced"
     end
 
     def print_verification(verification, applied:, transfers: [])
@@ -375,7 +397,7 @@ module DiscourseSiwe
     def pending_parts(transfer)
       parts = []
       parts << 'merge' if transfer[:merge]
-      parts << 'delete siwe row' if transfer[:delete] && !transfer[:merge]
+      parts << 'delete siwe row' if (transfer[:delete] && !transfer[:merge]) || transfer[:delete_orphan]
       parts << 'provider_uid' if transfer[:uid]
       parts + (transfer[:fields] + transfer[:renames]).map { |c| c[:field].to_s }
     end
@@ -392,9 +414,39 @@ module DiscourseSiwe
           "#{c[:info]} info values and #{c[:usernames]} usernames written" \
           "#{c[:usernames_skipped].positive? ? " (#{c[:usernames_skipped]} usernames left as they were)" : ''}; " \
           "#{c[:merged]} duplicate users merged, #{c[:rows_deleted] - c[:merged]} orphan rows replaced."
-      say "Backup tables: #{tables.join(', ')}. To put back what was written outside merges:"
+      say "Backup tables: #{tables.join(', ')}. To put back what this run wrote outside merges:"
       REWRITE.restore_sql(@run_id).each_line { |line| say "  #{line.chomp}" }
-      say 'This does not undo a merge and does not rename usernames back (see the README).'
+      say 'This does not undo a merge and does not rename usernames back (see the README). It resets every ' \
+          'siwe user to the backup, so use it right after the apply, with wallet sign-ins still off.'
+      return if @earlier_runs.empty?
+
+      say "To roll back a transfer that an earlier apply started, use the same SQL with that apply's run id " \
+          "(oldest here: #{@earlier_runs.first}) in place of #{@run_id}."
+    end
+
+    # A re-run after a failure takes a new backup of a forum that is already
+    # partly transferred: that one is not the way back to the start.
+    def print_earlier_runs
+      return if @earlier_runs.empty?
+
+      say "Earlier backups exist: #{@earlier_runs.map { |run| "siwe_backup_#{run}_*" }.join(', ')}. If this apply " \
+          'continues a transfer that an earlier apply started (a re-run after a failure), the rollback point of ' \
+          "the whole transfer is the backup of that first apply (oldest here: #{@earlier_runs.first}), not " \
+          "#{@run_id}: this backup already holds what the earlier apply wrote."
+    end
+
+    # Options that change the plan. A dry run, an apply and a verify only
+    # agree when they get the same ones.
+    def print_plan_options
+      options = []
+      options << "SUSPECT_AFTER=#{@suspect_after.utc.strftime('%Y-%m-%dT%H:%M:%SZ')}" if @suspect_after
+      options << "REVIEWED_ROWS=#{@reviewed.join(',')}" if @reviewed.any?
+      options << 'KEEP_USERNAMES=1' if @keep_usernames
+      options << 'MERGE_DUPLICATES=1' if @merge
+      options << 'SKIP_CODE_CHECK=1' if @code_for.nil?
+      return if options.empty?
+
+      say "\nThese options change the plan; give the same ones to every dry run, apply and verify: #{options.join(' ')}"
     end
   end
 end

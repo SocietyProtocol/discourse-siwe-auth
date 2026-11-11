@@ -388,7 +388,7 @@ and writes only what is still different:
 | Account info | `nickname` / `name` in the row's `info` json | `S` when they held `E` |
 | Society cache | `society_resolved_at` custom field | deleted for accounts moved in this run, so the next sign-in looks the profile up again for `S` (with `E` as fallback) |
 | A duplicate user | a second user who already signed in as `S` | merged into the original with Discourse's `UserMerger` (`MERGE_DUPLICATES=1`): posts, likes, groups, badges, notifications, bookmarks and emails end on one user |
-| A leftover row | a `siwe` row for `S` with no user | deleted, because it blocks the unique index. `UserMerger` leaves such a row when both merged users had a `siwe` row, for example after a merge in the admin UI (Discourse's own daily cleanup removes it later) |
+| A leftover row | a `siwe` row holding `S` with no user | deleted, because it blocks the unique index. `UserMerger` leaves such a row when both merged users had a `siwe` row, for example after a merge in the admin UI (Discourse's own daily cleanup removes it later) |
 
 Accounts that an earlier run already moved (`already`, `adopt`, `recase`) are
 checked for the same fields, so a re-run finishes whatever an older version or
@@ -416,7 +416,8 @@ The dry run prints one line per `siwe` row with a status:
 | Status | Meaning | Written |
 | --- | --- | --- |
 | `rewrite` | uid is an EOA | everything above |
-| `duplicate` | uid is an EOA and another user already signed in as its `S` | with `MERGE_DUPLICATES=1`: the newer user is merged into the older one, then as `rewrite`. Without it: nothing, and verification fails |
+| `duplicate` | uid is an EOA and another user already signed in as its `S`; or two users hold the same address in different case (the first rewrite stored `S` lowercase, and a later sign-in created a second user on the checksummed `S`) | with `MERGE_DUPLICATES=1`: the newer user is merged into the older one, then as `rewrite`. Without it: nothing, and verification fails |
+| `conflict` | three or more users on one address, or two with no proven owner | nothing; verification fails. Merge them in the admin UI until at most two are left, then run again |
 | `smart_of` | the `S` row of such a pair, owner not recorded | handled with its `duplicate` |
 | `already` | uid is `S` and `siwe_owner_address` proves it | only fields or names that are still off |
 | `adopt` | uid is `S`; the owner is proven by the row's sign-in record (`extra.owner_address`), the address map, or an orphan row for `E` | the owner, plus fields and names |
@@ -455,7 +456,12 @@ unless its derivation matches every pair in `script/forum-address-map.json`
   command again: it continues where it stopped, also after a merge that died
   half way (the detached `S` row is replaced). If `UserMerger` died before it
   deleted the duplicate, that user still exists without a wallet: merge it
-  again from its admin page.
+  again from its admin page. No later run and no verification can see such a
+  user (it has no `siwe` row any more); the failed run prints its id.
+- **A re-run takes a new backup of a forum that is already partly
+  transferred.** The rollback point of the whole transfer is the backup of
+  the first apply, not of the last one. An apply lists the earlier backups it
+  finds (`Earlier backups exist: ...`) and says so.
 - **Verification.** An apply ends by planning again from the database. It
   exits 1, with `VERIFICATION FAILED` and one `UNRESOLVED` line per account,
   if any `siwe` account is still on an old wallet without being a recognised
@@ -468,13 +474,20 @@ unless its derivation matches every pair in `script/forum-address-map.json`
 | --- | --- |
 | `MERGE_DUPLICATES=1` | merge duplicate users. The older user (by creation time, then id) survives. A survivor whose username was cut from `E` gets the plain username for `S`, also when its duplicate held that name |
 | `FULL_BACKUP_TAKEN=1` | confirms a full backup exists; an apply that would merge is refused without it |
-| `SUSPECT_AFTER=<ISO time>` | rows created later with no proof of their owner are left as `review`. Set it to the first deploy of a build with the Light Account login (`8a4f838` or later): `8a4f838` signed in as `S` without recording the owner, and an `S` that is not in the map would otherwise be taken for an EOA and moved to the Light Account of `S` |
+| `SUSPECT_AFTER=<ISO time>` | a time with `Z` or an offset (`2026-10-15T16:00:00Z`); without a zone it is read as UTC. Rows created later with no proof of their owner are left as `review`. Set it to the first deploy of a build with the Light Account login (`8a4f838` or later): `8a4f838` signed in as `S` without recording the owner, and an `S` that is not in the map would otherwise be taken for an EOA and moved to the Light Account of `S` |
 | `NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1` | instead of `SUSPECT_AFTER`: nobody ever signed in through such a build here. An apply is refused with neither |
 | `REVIEWED_ROWS=12,15` | `review` rows you checked and accept as they are |
 | `KEEP_USERNAMES=1` | do not rename usernames |
 | `RPC_URL=<json-rpc>` | used only to tell contract wallets from EOAs (`eth_getCode`); default **siwe ethereum rpc url**. It is never printed |
 | `SKIP_CODE_CHECK=1` | run without an RPC; contract wallets would be rewritten too |
 | `FORUM_ADDRESS_MAP=<path>` | another address map for the self-test |
+
+`SUSPECT_AFTER`, `REVIEWED_ROWS`, `KEEP_USERNAMES`, `MERGE_DUPLICATES` and
+`SKIP_CODE_CHECK` change the plan. A dry run, an apply and a verify only
+agree when they get the same ones: a `verify` without the `SUSPECT_AFTER` or
+`REVIEWED_ROWS` of the apply reports rows as unresolved or still to write
+that the apply left on purpose. Every run prints the ones it was given, ready
+to copy to the next command.
 
 #### Production procedure
 
@@ -492,18 +505,25 @@ app: raise the container's memory limit first if it has one.
    can read it and use the script instead of the rake task in the steps below.
 3. **Take a full backup** (`discourse backup`, the admin Backups page, or a
    dump of the database) and keep it. It is the only way back from a merge.
-4. **Dry run** and read all of it:
+4. **Dry run** with the options you will apply with, and read all of it:
 
    ```bash
+   # production: nobody has signed in through the Light Account login yet
    sudo -E -u discourse bundle exec rake siwe:smart_accounts:transfer
+
+   # staging, or any forum where that login was already live
+   SUSPECT_AFTER=<first deploy time, with Z> \
+     sudo -E -u discourse bundle exec rake siwe:smart_accounts:transfer
    ```
 
    Add `MERGE_DUPLICATES=1` if the table has `duplicate` rows. No `rewrite`
    row may have a `from` that is a Light Account (the tool aborts if it is one
    from the map). Check each `review` row by hand: compare its `from` with the
    map and the user's history, then either fix it or list its id in
-   `REVIEWED_ROWS`. `AFTER AN APPLY` must end with `0 unresolved`.
-5. **Apply**, with the options of the dry run plus the confirmations:
+   `REVIEWED_ROWS` and dry-run again. `AFTER AN APPLY` must end with
+   `0 unresolved`.
+5. **Apply**, with exactly the options of the last dry run plus the
+   confirmations:
 
    ```bash
    NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1 \
@@ -516,8 +536,15 @@ app: raise the container's memory limit first if it has one.
    1 was skipped), and add `MERGE_DUPLICATES=1 FULL_BACKUP_TAKEN=1` to merge.
    It must end with `VERIFICATION: ... 0 unresolved` and exit 0. Note the
    backup run id it prints.
-6. **Check.** `rake siwe:smart_accounts:verify` exits 0, and a second dry run
-   says `PLAN: nothing to write.`
+6. **Check**, again with the options of the apply (`SUSPECT_AFTER`,
+   `REVIEWED_ROWS`, `KEEP_USERNAMES`, `MERGE_DUPLICATES`; the apply prints
+   them on its last line). `rake siwe:smart_accounts:verify` exits 0, and a
+   second dry run says `PLAN: nothing to write.`:
+
+   ```bash
+   SUSPECT_AFTER=<same> REVIEWED_ROWS=<same> \
+     sudo -E -u discourse bundle exec rake siwe:smart_accounts:verify
+   ```
 7. **Turn Discourse siwe enabled back on** and sign in once with a
    transferred wallet: it must land on the existing user, with its posts.
 8. Drop the `siwe_backup_<run>_*` tables once the switch is settled.
@@ -526,6 +553,17 @@ app: raise the container's memory limit first if it has one.
 
 Turn off **Discourse siwe enabled** first, and roll the plugin back to the
 previous version afterwards.
+
+Roll back right after the apply, while sign-ins are still off. The restore
+resets every `siwe` user in the backup, not only the ones the run changed: run
+days later, it also reverts display names and usernames that members changed
+themselves since, and removes an owner address the login recorded since.
+
+`<run>` is the run id of the **first** apply of this transfer. If an apply
+failed and was run again, the later run's backup already holds what the first
+one wrote, and the SQL the later run printed only goes back to that state:
+use the same SQL with the first run id (the re-run names it in `Earlier
+backups exist`).
 
 *No merge happened.* Run the SQL the apply printed (it is also what
 `DiscourseSiwe::SmartAccountRewrite.restore_sql('<run>')` returns). With a
