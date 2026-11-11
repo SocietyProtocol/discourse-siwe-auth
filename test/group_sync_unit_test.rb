@@ -10,6 +10,7 @@
 require 'json'
 require 'set'
 require 'tempfile'
+require 'tmpdir'
 require 'minitest/autorun'
 require_relative '../lib/discourse_siwe/eth_rpc'
 require_relative '../lib/discourse_siwe/member_addresses'
@@ -206,6 +207,11 @@ class MemberAddressesTest < Minitest::Test
     assert_equal [], addresses({})
   end
 
+  def test_a_plain_wallet_with_no_owner_and_no_map_is_just_itself
+    assert_equal [EOA], addresses({ 'wallet_address' => EOA })
+    assert_equal [EOA], addresses({ 'wallet_address' => EOA }, nil)
+  end
+
   def test_an_owner_without_a_wallet_is_still_covered
     assert_equal [EOA], addresses('siwe_owner_address' => EOA)
   end
@@ -225,7 +231,15 @@ class MemberAddressesTest < Minitest::Test
     assert_equal MAP.merge(other), DiscourseSiwe::MemberAddresses.load_address_map(keyed.path)
   end
 
-  def test_missing_or_broken_map_file_gives_an_empty_map
+  # The group sync must work with no address map at all.
+  def test_nil_blank_missing_or_broken_map_gives_an_empty_map
+    assert_equal({}, DiscourseSiwe::MemberAddresses.load_address_map(nil))
+    assert_equal({}, DiscourseSiwe::MemberAddresses.load_address_map(''))
+    assert_equal({}, DiscourseSiwe::MemberAddresses.load_address_map(Dir.tmpdir))
+    array = Tempfile.new('map')
+    array.write('["0x1"]')
+    array.flush
+    assert_equal({}, DiscourseSiwe::MemberAddresses.load_address_map(array.path))
     assert_equal({}, DiscourseSiwe::MemberAddresses.load_address_map('/no/such/file.json'))
     bad = Tempfile.new('map')
     bad.write('{not json')

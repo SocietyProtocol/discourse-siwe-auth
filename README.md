@@ -134,9 +134,57 @@ WalletConnect / Reown project ID. Without a project ID, only injected wallets
 | **Siwe society subgraph token** | _Secret._ Bearer token for the query gateway (`GRAPH_QUERY_GATEWAY_TOKEN`). The gateway rejects requests without it, so profile names do not resolve while this is empty. Set via the `DISCOURSE_SIWE_SOCIETY_SUBGRAPH_TOKEN` env var or the admin UI. |
 | **Siwe identity resolution mode** | Preferred resolution mode: `subgraph` (default, falls back to RPC) or `rpc` (direct contract calls only). |
 
+### Refreshing Society names
+
+Society profile lookups go through the query gateway with the bearer token
+above. A lookup that cannot be completed (network error, gateway rejection, bad
+response) is "unknown" and never overwrites a stored name or avatar. After
+setting the token, `rake 'siwe:refresh_society'` shows which members' names
+would change (dry run) and `rake 'siwe:refresh_society[false]'` applies it,
+moving members who were defaulted to their wallet address onto their Society
+name. A member's Light Account is looked up first; when it has no profile, the
+owner wallet in `siwe_owner_address` is looked up as well.
+
+## Groups follow badges
+
+Forum groups can follow on-chain Society badges. `siwe_group_badge_mapping`
+lists `badge_id:group` pairs separated by `|` (for example
+`13:governors|14:vip|15:vip|16:vip`); a member holding any badge of a group
+belongs to it. Membership is read from the badges contract with
+`balanceOfBatch` (`siwe_society_badges_rpc_url`, `siwe_society_badges_contract`,
+`siwe_society_badges_chain_id`) over every address on record for the member:
+their `wallet_address` (the Light Account), the owner wallet the sign-in
+proved (`siwe_owner_address`), and the pair from
+`script/forum-address-map.json`. Badges that were never migrated stay on the
+owner wallet, so both are checked. Without an owner or a map entry, a member
+is checked on their wallet alone. Everything ships **off**
+(`siwe_group_sync_mode` = `off`).
+
+* **Modes:** `off`, `log` (report what would change, change nothing) and
+  `enforce`.
+* **Never touched:** automatic groups (`admins`, `moderators`, `staff`,
+  `trust_level_*`) are refused as targets. Staff, group owners and
+  `siwe_group_sync_exempt_usernames` are never removed.
+* **Removals are slow on purpose:** a member must be seen without the badge
+  `siwe_group_sync_removal_confirmations` runs in a row, and more than
+  `max(siwe_group_sync_removal_floor, siwe_group_sync_removal_percent of the
+  group)` removals in one run removes nobody from that group. A member whose
+  balance could not be read is never removed, and a wrong chain, wrong
+  contract or RPC error stops the run before anything changes.
+* **Triggers:** a scheduled job (`Jobs::SiweGroupSync`, every 30 minutes) does
+  the full reconcile and is the only place removals happen; a per-login job
+  (`Jobs::SyncSiweUserGroups`) is add-only.
+
+```bash
+rake 'siwe:groups:bootstrap'            # dry run; [false] creates the closed groups
+rake 'siwe:groups:sync[log]'            # report only (the default)
+rake 'siwe:groups:sync[enforce]'        # apply
+rake 'siwe:groups:report'               # the last full report
+```
+
 ## Token-gated categories
 
-Groups that follow badge holders are described in [Groups follow badges](#configuration) (`siwe_group_badge_mapping`). Token-gated **categories** add the missing half: which groups can see which categories. It is configuration, applied by a rake task, never by a background job.
+Groups that follow badge holders are described in [Groups follow badges](#groups-follow-badges) (`siwe_group_badge_mapping`). Token-gated **categories** add the missing half: which groups can see which categories. It is configuration, applied by a rake task, never by a background job.
 
 Put the YAML in the `siwe_gating_config` site setting (it lives in the database, so the production layout is not in this public repo), or point `SIWE_GATING_FILE` at a file for one run.
 
@@ -163,6 +211,7 @@ categories:
 * `siwe:gating:status` shows drift between the YAML and the forum and what the badge sync would add or remove.
 * `siwe:gating:audit` is the mandatory check before restricting anything. It lists members of a gated group who hold no badge (they would lose access), members with no wallet (they would keep access forever), and gated groups no badge feeds. It exits non-zero until each item is resolved: remove them, grandfather them with `siwe_group_sync_exempt_usernames`, or give them the badge.
 * If Fritz edits a gated category's permissions in the admin UI, `status` reports it as drift and `provision[apply]` puts it back. The YAML wins.
+* If an admin edits a gated category's permissions in the admin UI, `status` reports it as drift and `provision[apply]` puts it back. The YAML wins.
 * Group lists and flair reveal who holds a badge by wallet. Choose each group's `visibility` accordingly.
 
 ## Compatibility notes (Discourse + Ruby 3.4)
@@ -272,8 +321,17 @@ suite.
 ruby test/ens_unit_test.rb
 ruby test/society_unit_test.rb
 ruby test/light_account_unit_test.rb
+ruby test/society_lookup_unit_test.rb
+ruby -r./test/support/pure_keccak -rtime test/group_sync_unit_test.rb
+ruby -r./test/support/pure_keccak -rtime test/gating_unit_test.rb
 ruby -r./test/support/pure_keccak -rtime test/badge_mirror_unit_test.rb
 ```
+
+`test/support/pure_keccak.rb` and `test/support/lib/digest/keccak.rb` are a
+test-only pure-Ruby Keccak-256 shim. Requiring `pure_keccak` lets these suites
+run on a machine that does not have the `keccak` gem installed (the plugin
+itself still uses the real gem in Discourse). `-rtime` loads `Time.iso8601`
+for older Rubies.
 
 `test/light_account_unit_test.rb` checks the Light Account derivation against
 every pair in `script/forum-address-map.json` and the rewrite planner. Without

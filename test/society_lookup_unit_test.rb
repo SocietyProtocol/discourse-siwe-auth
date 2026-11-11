@@ -144,6 +144,29 @@ class SocietyLookupTest < Minitest::Test
     assert_equal FAILED, resolve([200, 'not json']) { DiscourseSiwe::IdentityResolver.resolve(ADDR) }
   end
 
+  # A member whose own address has a profile, or who has no owner on record,
+  # costs exactly one lookup, and its answer is final.
+  def test_a_wallet_with_a_profile_costs_exactly_one_lookup
+    society = resolve([200, PROFILE_BODY]) { DiscourseSiwe::IdentityResolver.resolve(ADDR) }
+    assert_equal 'Ada', society[:name]
+    assert_equal 1, FakeHttp.requests.size
+
+    society = resolve([200, PROFILE_BODY]) { DiscourseSiwe::IdentityResolver.resolve_with_owner(ADDR, OWNER) }
+    assert_equal 'Ada', society[:name]
+    assert_equal 1, FakeHttp.requests.size
+  end
+
+  def test_no_profile_is_nil_after_exactly_one_lookup
+    empty = { data: { user: nil } }.to_json
+    society = resolve([200, empty]) { DiscourseSiwe::IdentityResolver.resolve(ADDR) }
+    assert_nil society
+    assert_equal 1, FakeHttp.requests.size
+
+    society = resolve([200, empty]) { DiscourseSiwe::IdentityResolver.resolve_with_owner(ADDR, nil) }
+    assert_nil society
+    assert_equal 1, FakeHttp.requests.size
+  end
+
   def test_owner_profile_is_used_when_the_smart_account_has_none
     society = resolve([200, { data: { user: nil } }.to_json], [200, PROFILE_BODY]) do
       DiscourseSiwe::IdentityResolver.resolve_with_owner(ADDR, OWNER)

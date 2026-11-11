@@ -23,9 +23,12 @@ module DiscourseSiwe
     end
 
     # fields: the user's custom fields (string keys).
-    # address_map: { eoa => smart } (see load_address_map).
+    # address_map: { eoa => smart } (see load_address_map); {} or nil when
+    # there is no map.
     # Returns a sorted, de-duplicated array of lowercase addresses.
     def addresses_for(fields, address_map: {})
+      fields ||= {}
+      address_map ||= {}
       wallet = normalize(fields['wallet_address'])
       owner = normalize(fields['siwe_owner_address'])
       found = [wallet, owner]
@@ -39,12 +42,15 @@ module DiscourseSiwe
 
     # Reads script/forum-address-map.json, which is either a flat
     # { eoa => smart } or keyed by chain id ({ "1" => { eoa => smart } }).
-    # Keys and values are lowercased. Returns {} when the file is absent so
-    # the sync still works from the user's own fields.
+    # Keys and values are lowercased. Returns {} when the path is nil or
+    # blank, the file is absent, unreadable or not a JSON object, so the sync
+    # still works from the user's own fields.
     def load_address_map(path, chain_id: nil)
-      return {} unless File.exist?(path)
+      return {} if path.to_s.strip.empty? || !File.file?(path)
 
       json = JSON.parse(File.read(path))
+      return {} unless json.is_a?(Hash)
+
       pairs = if json.values.any? { |v| v.is_a?(Hash) }
         chain_id ? (json[chain_id.to_s] || {}).to_a : json.values.select { |v| v.is_a?(Hash) }.flat_map(&:to_a)
       else
@@ -55,7 +61,7 @@ module DiscourseSiwe
         b = normalize(smart)
         map[a] = b if a && b
       end
-    rescue JSON::ParserError
+    rescue JSON::ParserError, SystemCallError
       {}
     end
   end
