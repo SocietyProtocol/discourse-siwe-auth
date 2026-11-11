@@ -354,10 +354,25 @@ shipped.
 `script/rewrite_smart_account_users.rb` covers every `siwe` account on the
 forum (not only Outpost members). For each one it derives `S` in Ruby, then:
 
-- sets `provider_uid` to checksummed `S`, and `nickname` / `name` in the
-  account's `info` when they held `E`;
+- sets `provider_uid` to checksummed `S`;
 - sets the `wallet_address` custom field to `S` and `siwe_owner_address` to `E`;
-- renames a wallet-style display name (`0x9ba7…7c3c`) to `S`'s short form.
+- renames what the login derived from `E` to what a fresh Light Account login
+  would get:
+  - a display name that is `E` in full (any case) becomes checksummed `S`, or
+    `S`'s short form when **siwe society enabled** is on (new users get the
+    short form there);
+  - a wallet-style display name (`0x9ba7…7c3c`) becomes `S`'s short form;
+  - a username Discourse cut from `E` (`0x` plus at least 8 hex digits that
+    are a prefix of `E`) becomes the username Discourse suggests for `S`,
+    through `UsernameChanger`, so mentions and quotes follow. Pass
+    `KEEP_USERNAMES=1` to leave usernames alone;
+  - `nickname` / `name` in the account's `info` when they held `E`.
+
+  Any other value is kept: a name the user chose, a Society or ENS name, or
+  another wallet's address. Rows an earlier run already moved (`already`,
+  `adopt`, `recase`) are checked as well, so re-running the script fixes
+  names that an older version left on `E`. The dry run prints every rename
+  under `RENAMES`.
 
 It refuses to run unless its derivation matches every pair in
 `script/forum-address-map.json` (flat or chain-keyed). It skips rows that are
@@ -406,7 +421,7 @@ wallet check and should point at the forum's chain.
        SELECT * FROM user_custom_fields
        WHERE name IN ('wallet_address', 'siwe_owner_address');
      CREATE TABLE siwe_backup_names AS
-       SELECT id, name FROM users
+       SELECT id, name, username FROM users
        WHERE id IN (SELECT user_id FROM siwe_backup_accounts);"
    ```
 
@@ -427,6 +442,9 @@ wallet check and should point at the forum's chain.
    `rewrite` row may have a `from` that is a known Light Account (the
    script aborts if one does). Check every `review` row by hand: compare
    its `from` with the map and the user's history before changing it.
+   Read the `RENAMES` list under the table too: each line is one display
+   name, username or `info` value that still holds the old address and the
+   value it will get.
 
 4. Turn off **Discourse siwe enabled**, so nobody signs in with the old page
    between the rewrite and the rebuild.
@@ -434,7 +452,7 @@ wallet check and should point at the forum's chain.
 5. Apply (same command with `APPLY=1`, the same `SUSPECT_AFTER` or
    `NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1`, plus `MERGE_DUPLICATES=1` if wanted).
    Re-run the dry run: every row should now be `already`, apart from the
-   `review` rows you chose to leave.
+   `review` rows you chose to leave, and `RENAMES` should say `none`.
 
 6. Deploy the plugin (new `siwe.iife.js`, strategy and lookups):
    `./launcher rebuild app`. Turn **Discourse siwe enabled** back on and sign
@@ -453,6 +471,11 @@ sudo -u postgres psql discourse -c "
     FROM siwe_backup_fields b WHERE f.id = b.id;
   UPDATE users u SET name = b.name FROM siwe_backup_names b WHERE u.id = b.id;"
 ```
+
+Usernames the script renamed are not restored by this SQL (a username change
+also rewrites mentions and quotes). Put one back from the Rails console with
+`UsernameChanger.change(user, old_username, Discourse.system_user)`, using the
+`username` column of `siwe_backup_names`.
 
 Users who signed in as `S` after the deploy and have no row in the backup keep
 their `S` account. Drop the `siwe_backup_*` tables once the switch is settled.

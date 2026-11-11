@@ -215,6 +215,121 @@ class RewritePlanTest < Minitest::Test
   end
 end
 
+class DerivedRenamesTest < Minitest::Test
+  EOA_UID = LA.checksum(EOA)
+  SHORT_EOA = '0x9ba7…7c3c'
+  SHORT_SMART = '0xa47f…88cb'
+
+  def fields(**over)
+    { name: 'Alice', username: 'alice', info_nickname: nil, info_name: nil }.merge(over)
+  end
+
+  def renames(fields, **opts)
+    REWRITE.derived_renames(fields, EOA, SMART, **opts).map { |r| [r[:field], r[:to]] }.to_h
+  end
+
+  def test_full_address_name_becomes_the_light_account
+    [EOA, EOA_UID, EOA.upcase.sub('0X', '0x'), " #{EOA_UID} "].each do |name|
+      assert_equal({ name: SMART }, renames(fields(name: name)), name)
+    end
+  end
+
+  def test_full_address_name_is_shortened_when_fresh_logins_get_the_short_form
+    assert_equal({ name: SHORT_SMART }, renames(fields(name: EOA_UID), short_name: true))
+  end
+
+  def test_short_wallet_name_is_renamed_in_both_modes
+    assert_equal({ name: SHORT_SMART }, renames(fields(name: SHORT_EOA)))
+    assert_equal({ name: SHORT_SMART }, renames(fields(name: SHORT_EOA), short_name: true))
+  end
+
+  def test_username_cut_from_the_address_is_renamed
+    assert_equal({ username: SMART[0, 20] }, renames(fields(username: EOA_UID[0, 20])))
+    assert_equal({ username: SMART[0, 20] }, renames(fields(username: EOA[0, 20])))
+    assert_equal({ username: SMART }, renames(fields(username: EOA_UID)))
+    suggested = renames(fields(username: EOA_UID[0, 20]), username_for: ->(s) { "#{s[0, 19]}1" })
+    assert_equal({ username: "#{SMART[0, 19]}1" }, suggested)
+  end
+
+  def test_info_values_holding_the_address_are_renamed
+    got = renames(fields(info_nickname: EOA_UID, info_name: EOA))
+    assert_equal({ info_nickname: SMART, info_name: SMART }, got)
+  end
+
+  def test_chosen_and_resolved_names_are_kept
+    kept = [
+      fields,
+      fields(name: 'vitalik.eth', username: 'vitalik', info_nickname: 'vitalik.eth', info_name: 'vitalik.eth'),
+      fields(name: 'Society Member', username: 'member'),
+      fields(name: nil, username: nil),
+      fields(name: '', username: ''),
+      # another wallet's address, short form and username
+      fields(name: RewritePlanTest::EOA2, username: RewritePlanTest::EOA2[0, 20], info_name: RewritePlanTest::EOA2),
+      fields(name: '0x51bd…6eeb'),
+      # too short or not hex to be a cut address; address prefix with a suffix
+      fields(username: '0x9ba7'),
+      fields(username: '0x9ba7_fan'),
+      fields(username: "#{EOA[0, 19]}2"),
+      # a name that only contains the address
+      fields(name: "wallet #{EOA}"),
+      fields(name: '0x9ba7...7c3c'),
+    ]
+    kept.each { |f| assert_empty REWRITE.derived_renames(f, EOA, SMART, short_name: true), f.inspect }
+  end
+
+  def test_renaming_is_idempotent
+    before = fields(name: EOA_UID, username: EOA_UID[0, 20], info_nickname: EOA_UID, info_name: EOA_UID)
+    [false, true].each do |short|
+      after = before.dup
+      REWRITE.derived_renames(before, EOA, SMART, short_name: short).each { |r| after[r[:field]] = r[:to] }
+      assert_empty REWRITE.derived_renames(after, EOA, SMART, short_name: short)
+    end
+  end
+
+  def test_unchanged_username_and_bad_addresses_give_nothing
+    same = REWRITE.derived_renames(fields(username: EOA[0, 20]), EOA, SMART, username_for: ->(_) { EOA[0, 20] })
+    assert_empty same
+    assert_empty REWRITE.derived_renames(fields(name: EOA), EOA, 'nope')
+    assert_empty REWRITE.derived_renames(fields(name: EOA), nil, SMART)
+    assert_empty REWRITE.derived_renames(fields(name: EOA), EOA, EOA_UID)
+  end
+end
+
+class AddressMoveTest < Minitest::Test
+  EOA_UID = LA.checksum(EOA)
+  PAIRS = [[EOA, SMART]].freeze
+
+  def row(id, uid, **opts)
+    { id: id, user_id: id * 10, username: "u#{id}", uid: uid, owner: nil, created_at: Time.utc(2026, 1, 1) }.merge(opts)
+  end
+
+  def move(rows, merge: false, **opts)
+    REWRITE.plan(rows, **opts).map { |p| REWRITE.address_move(p, merge: merge) }
+  end
+
+  def test_rewrite_moves_from_the_eoa_to_the_light_account
+    assert_equal [[EOA_UID, SMART]], move([row(1, EOA_UID)], code_for: ->(_) { '' })
+  end
+
+  def test_rows_moved_by_an_earlier_run_still_report_their_owner
+    assert_equal [[EOA, SMART]], move([row(1, SMART, owner: EOA)])                      # already
+    assert_equal [[EOA, SMART]], move([row(1, SMART.downcase, owner: EOA)])             # recase
+    assert_equal [[EOA, SMART]], move([row(1, SMART)], known_pairs: PAIRS)              # adopt
+    assert_equal [[EOA, SMART]], move([row(1, SMART.downcase)], known_pairs: PAIRS)     # recase, owner from map
+  end
+
+  def test_duplicates_move_only_when_merged
+    rows = [row(1, EOA_UID), row(2, SMART)]
+    assert_equal [nil, nil], move(rows, code_for: ->(_) { '' })
+    assert_equal [[EOA_UID, SMART], nil], move(rows, merge: true, code_for: ->(_) { '' })
+  end
+
+  def test_skipped_rows_move_nothing
+    rows = [row(1, 'not-an-address'), row(2, EOA_UID, user_id: nil), row(3, RewritePlanTest::EOA2)]
+    assert_equal [nil, nil, nil], move(rows, code_for: ->(_) { '' })
+  end
+end
+
 class SocietyOwnerFallbackTest < Minitest::Test
   RESOLVER = DiscourseSiwe::IdentityResolver
 

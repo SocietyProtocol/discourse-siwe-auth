@@ -6,8 +6,14 @@
 # For each siwe UserAssociatedAccount whose uid is an EOA E, derives
 # S = LightAccountFactory.getAddress(E, 0) and moves the row to S
 # (EIP-55 checksummed, as the strategy's uid). Also rewrites the address in
-# the user's wallet_address custom field, the row's info json and a
-# wallet-style display name, and stores E in siwe_owner_address.
+# the user's wallet_address custom field and stores E in siwe_owner_address.
+#
+# Then renames what the login derived from E to what a fresh Light Account
+# login would get: a display name that is E (in full or in the short
+# 0x9ba7…7c3c form), a username Discourse cut from E, and nickname / name in
+# the row's info json. Anything else (a chosen name, a Society or ENS name)
+# is left alone. Rows an earlier run already moved are checked too, so a
+# re-run fixes names that run left behind. The dry run lists every rename.
 #
 # Dry run by default. From the Discourse container, with this plugin checkout
 # on disk (see README "Moving forum users to Light Accounts"):
@@ -29,6 +35,8 @@
 #                       Account login (8a4f838 or later): that login signs in
 #                       as S without recording the owner, and an S that is
 #                       not in the map would otherwise be rewritten to LA(S).
+#   KEEP_USERNAMES=1    do not rename usernames cut from the old address
+#                       (display names and info are still renamed)
 #   NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1
 #                       with APPLY=1 and no SUSPECT_AFTER: confirm no such
 #                       build ever ran on this forum
@@ -47,6 +55,7 @@ REWRITE = DiscourseSiwe::SmartAccountRewrite
 
 apply = ENV["APPLY"] == "1"
 merge = ENV["MERGE_DUPLICATES"] == "1"
+keep_usernames = ENV["KEEP_USERNAMES"] == "1"
 rpc_url = ENV["RPC_URL"].presence || DiscourseSiwe::EthRpc.rpc_url
 suspect_after = ENV["SUSPECT_AFTER"].presence && Time.parse(ENV["SUSPECT_AFTER"])
 
@@ -105,6 +114,44 @@ known_smarts = pairs.map { |_, smart| smart.downcase }.to_set
 bad = plan.select { |p| %i[rewrite duplicate].include?(p[:status]) && known_smarts.include?(p[:from].downcase) }
 abort "BUG: would rewrite known Light Accounts #{bad.map { |p| p[:from] }.join(', ')}" if bad.any?
 
+by_id = accounts.index_by(&:id)
+
+# With MERGE_DUPLICATES=1 the older of the two users survives.
+survivor = lambda do |p|
+  [by_id[p[:row][:id]], by_id[p[:other][:id]]].sort_by { |a| [a.user.created_at, a.user.id] }.first
+end
+
+# Names derived from the old address, per plan entry: [account, renames].
+short_name = SiteSetting.siwe_society_enabled
+username_for = ->(smart) { UserNameSuggester.suggest(smart) }
+renames = plan.each_with_object({}) do |p, out|
+  move = REWRITE.address_move(p, merge: merge)
+  next unless move
+
+  account = p[:status] == :duplicate ? survivor.call(p) : by_id[p[:row][:id]]
+  user = account.user
+  info = account.info || {}
+  list = REWRITE.derived_renames(
+    { name: user.name, username: user.username, info_nickname: info["nickname"], info_name: info["name"] },
+    move[0], move[1], short_name: short_name, username_for: username_for,
+  )
+  list.reject! { |r| r[:field] == :username } if keep_usernames
+  out[p[:row][:id]] = [account, list] if list.any?
+end
+
+rename_count = renames.values.sum { |_, list| list.size }
+if rename_count.zero?
+  puts "\nRENAMES: none (no name, username or info value is derived from an old address)"
+else
+  puts "\nRENAMES (values derived from the old address#{keep_usernames ? '; KEEP_USERNAMES=1, usernames kept' : ''}):"
+  renames.each_value do |account, list|
+    list.each do |r|
+      puts "  user #{account.user_id} (#{account.user.username}) #{r[:field]}: #{r[:from]} -> #{r[:to]}"
+    end
+  end
+  puts "#{rename_count} renames on #{renames.size} users"
+end
+
 unless apply
   puts "\nDRY RUN: nothing written. Re-run with APPLY=1 to write."
   exit
@@ -120,9 +167,7 @@ if merge && duplicates.any? && !defined?(::UserMerger)
 end
 
 swap_address = lambda do |account, user, from, to|
-  info = (account.info || {}).dup
-  %w[nickname name].each { |k| info[k] = to if LA.same_address?(info[k], from) }
-  account.update!(provider_uid: to, info: info)
+  account.update!(provider_uid: to)
 
   cf_wallet = user.custom_fields["wallet_address"]
   if cf_wallet.blank? || LA.same_address?(cf_wallet, from) || LA.same_address?(cf_wallet, to)
@@ -130,17 +175,27 @@ swap_address = lambda do |account, user, from, to|
   end
   user.custom_fields["siwe_owner_address"] = from.downcase
   user.save_custom_fields(true)
-
-  if (user.custom_fields["preferred_identity"] || "wallet") == "wallet" &&
-       user.name == REWRITE.short_wallet(from)
-    user.update!(name: REWRITE.short_wallet(to))
-  end
 end
 
-by_id = accounts.index_by(&:id)
+# Display name and info json, inside the transaction. Usernames go through
+# UsernameChanger after it commits (it enqueues a job that rewrites mentions).
+rename_fields = lambda do |account, list|
+  info = (account.info || {}).dup
+  list.each do |r|
+    case r[:field]
+    when :name then account.user.update!(name: r[:to])
+    when :info_nickname then info["nickname"] = r[:to]
+    when :info_name then info["name"] = r[:to]
+    end
+  end
+  account.update!(info: info) if info != (account.info || {})
+end
+
 ActiveRecord::Base.transaction do
   plan.each do |p|
     account = by_id[p[:row][:id]]
+    renamed = renames[p[:row][:id]]
+    rename_fields.call(*renamed) if renamed
     case p[:status]
     when :rewrite
       swap_address.call(account, account.user, p[:from], p[:to])
@@ -154,7 +209,8 @@ ActiveRecord::Base.transaction do
       next unless merge
 
       other = by_id[p[:other][:id]]
-      original, newer = [account, other].sort_by { |a| [a.user.created_at, a.user.id] }
+      original = survivor.call(p)
+      newer = original == account ? other : account
       newer.destroy!
       swap_address.call(original, original.user, p[:from], p[:to])
       UserMerger.new(newer.user, original.user, Discourse.system_user).merge!
@@ -163,5 +219,22 @@ ActiveRecord::Base.transaction do
   end
 end
 
+username_changes = 0
+renames.each_value do |account, list|
+  list.select { |r| r[:field] == :username }.each do |r|
+    user = account.user.reload
+    next if user.username == r[:to]
+
+    to = UserNameSuggester.suggest(r[:to], current_username: user.username)
+    unless UsernameChanger.change(user, to, Discourse.system_user)
+      abort "username change failed for user #{user.id} (#{user.username} -> #{to}): " \
+            "#{user.errors.full_messages.join(', ')}. Everything else is written; re-run to retry."
+    end
+    username_changes += 1
+    puts "renamed user #{user.id}: #{r[:from]} -> #{to}"
+  end
+end
+
 written = plan.count { |p| %i[rewrite recase adopt].include?(p[:status]) }
-puts "\nAPPLIED: #{written} accounts rewritten#{merge ? ", #{duplicates.size} duplicates merged" : ''}."
+puts "\nAPPLIED: #{written} accounts rewritten#{merge ? ", #{duplicates.size} duplicates merged" : ''}, " \
+     "#{rename_count - username_changes} names/info values and #{username_changes} usernames renamed."
