@@ -1201,7 +1201,9 @@ class PlanOptionsTest < Minitest::Test
 
     # the same forum without them does not verify: the reason for the line
     refute transfer(forum, no_login_deployed: false).verify[:ok]
+    refute_includes output, 'These options change the plan'
     assert transfer(forum, **opts).verify[:ok]
+    assert_includes output, line
   end
 
   def test_suspect_after_without_a_zone_is_utc
@@ -1276,6 +1278,33 @@ class TransferRunnerEnvTest < Minitest::Test
     forum = FakeForum.new.add_wallet_user(1, EOA2_UID)
     refute run_with(forum, {}, verify_only: true)
     assert_empty forum.calls
+  end
+
+  def test_restore_sql_prints_the_sql_of_an_existing_backup_run
+    forum = FakeForum.new.add_wallet_user(1, EOA2_UID).add_wallet_user(2, EOA3_UID)
+    lines = []
+    out = ->(line) { lines << line }
+    refute RUNNER.restore_sql('20261111153000', store: forum, out: out)
+    assert_includes lines.join("\n"), 'No siwe_backup_* set exists'
+
+    transfer(forum, apply: true, run_id: '20261111153000').run
+    forum.rows[2][:uid] = EOA3_UID # a later apply of the same transfer takes a second backup
+    transfer(forum, apply: true, run_id: '20261111160000').run
+    before = forum.state
+
+    lines.clear
+    assert RUNNER.restore_sql(' 20261111153000 ', store: forum, out: out)
+    assert_equal REWRITE.restore_sql('20261111153000').lines.map(&:chomp), lines
+
+    lines.clear
+    assert RUNNER.restore_sql('20261111160000', store: forum, out: out)
+    assert_includes lines.last, 'oldest backup here: 20261111153000'
+
+    lines.clear
+    refute RUNNER.restore_sql('20260101000000', store: forum, out: out)
+    assert_includes lines.join("\n"), 'Backups here, oldest first: 20261111153000, 20261111160000'
+    refute RUNNER.restore_sql("x'; DROP TABLE users; --", store: forum, out: out)
+    assert_equal before, forum.state
   end
 
   def test_no_rpc_and_no_skip_is_an_error_and_the_url_is_never_printed

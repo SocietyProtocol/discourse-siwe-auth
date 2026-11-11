@@ -18,6 +18,7 @@
 #   APPLY=1             back up, write, then verify (exit 1 if an account is
 #                       left on an old wallet)
 #   VERIFY=1            only the read-only verification
+#   RESTORE_SQL=<run>   only print the rollback SQL of that backup run
 #   MERGE_DUPLICATES=1  merge a user who already signed in as the Light
 #                       Account into the original user (UserMerger)
 #   FULL_BACKUP_TAKEN=1 with APPLY=1, confirms a full `discourse backup`
@@ -54,6 +55,10 @@ $VERBOSE = nil
   load File.join(plugin_root, "lib/discourse_siwe/#{file}.rb")
 end
 $VERBOSE = verbose
+
+unless ENV["RESTORE_SQL"].to_s.strip.empty?
+  exit(DiscourseSiwe::SmartAccountTransferRunner.restore_sql(ENV["RESTORE_SQL"]) ? 0 : 1)
+end
 
 ok = DiscourseSiwe::SmartAccountTransferRunner.run(
   env: ENV, apply: ENV["APPLY"] == "1", verify_only: ENV["VERIFY"] == "1",

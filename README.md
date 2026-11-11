@@ -366,6 +366,7 @@ notifications and settings. It is one tool with two entry points:
 rake siwe:smart_accounts:transfer            # dry run: prints the plan, writes nothing
 rake 'siwe:smart_accounts:transfer[apply]'   # backup, write, verify
 rake siwe:smart_accounts:verify              # read-only check, exit 1 on failure
+rake 'siwe:smart_accounts:restore_sql[<run>]' # print the rollback SQL of a backup run
 
 # the forum still runs an older version: same code, loaded from a checkout
 rails runner /path/discourse-siwe-auth/script/rewrite_smart_account_users.rb            # dry run
@@ -450,7 +451,9 @@ unless its derivation matches every pair in `script/forum-address-map.json`
   Discourse runs it, outside a wrapping transaction (it moves posts topic by
   topic and deletes a user). Each merge is followed by one transaction for the
   surviving account. Usernames change last, through `UsernameChanger`, which
-  rewrites mentions in a background job.
+  rewrites mentions and quotes in a background job. It rewrites the mentions
+  Discourse recorded: an `@name` of a user who could not see that post (a
+  category closed to them) was never a mention and stays as plain text.
 - **Idempotent.** Every step writes only what is still different. A second
   apply writes nothing and takes no backup. After a failure, run the same
   command again: it continues where it stopped, also after a merge that died
@@ -565,10 +568,12 @@ one wrote, and the SQL the later run printed only goes back to that state:
 use the same SQL with the first run id (the re-run names it in `Earlier
 backups exist`).
 
-*No merge happened.* Run the SQL the apply printed (it is also what
-`DiscourseSiwe::SmartAccountRewrite.restore_sql('<run>')` returns). With a
-database outside the container, paste it into `bundle exec rails dbconsole -p`
-instead of `psql`:
+*No merge happened.* Run the SQL the apply printed. To print it again for a
+run id: `rake 'siwe:smart_accounts:restore_sql[<run>]'` (or
+`RESTORE_SQL=<run> rails runner .../script/rewrite_smart_account_users.rb`);
+it lists the backups that exist when the run id is wrong. With a database
+outside the container, paste it into `bundle exec rails dbconsole -p` instead
+of `psql`:
 
 ```bash
 sudo -u postgres psql discourse <<'SQL'
