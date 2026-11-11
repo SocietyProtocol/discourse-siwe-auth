@@ -49,12 +49,22 @@ module DiscourseSiwe
         merge: env['MERGE_DUPLICATES'] == '1',
         keep_usernames: env['KEEP_USERNAMES'] == '1',
         short_name: short_name.nil? ? SiteSetting.siwe_society_enabled : short_name,
-        suspect_after: suspect_after.empty? ? nil : Time.parse(suspect_after),
+        suspect_after: suspect_after.empty? ? nil : parse_time(suspect_after),
         no_login_deployed: env['NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED'] == '1',
         full_backup_taken: env['FULL_BACKUP_TAKEN'] == '1',
         reviewed: env['REVIEWED_ROWS'].to_s.split(',').map(&:strip).reject(&:empty?).map { |id| Integer(id) },
         out: out,
       )
+    end
+
+    # A time with no zone is UTC, never the server's local time.
+    ZONED_TIME_RE = /(z|utc|gmt)\s*\z|\d:\d\d(:\d\d(\.\d+)?)?\s*[+-]\d\d(:?\d\d)?\s*\z/i.freeze
+
+    def parse_time(text)
+      return Time.parse(text).utc if text.match?(ZONED_TIME_RE)
+
+      # Time.parse ignores a zone that follows a bare date.
+      Time.parse("#{text}#{text.match?(/\d:\d\d/) ? '' : ' 00:00'} UTC").utc
     end
 
     # The RPC URL carries an API key: it is never printed.
@@ -118,6 +128,15 @@ module DiscourseSiwe
                  SmartAccountSyncState.backup_tables(run)
         tables.each { |name, select| ActiveRecord::Base.connection.execute("CREATE TABLE #{name} AS #{select}") }
         tables.map(&:first)
+      end
+
+      # Run ids of the complete siwe_backup_* sets already in the database.
+      def backup_runs
+        names = ActiveRecord::Base.connection.select_values(
+          "SELECT tablename FROM pg_tables WHERE schemaname = ANY (current_schemas(false)) " \
+          "AND tablename LIKE 'siwe!_backup!_%' ESCAPE '!'",
+        )
+        SmartAccountRewrite.backup_runs(names)
       end
 
       # Only a row nobody signs in to any more: no user, or a user that is

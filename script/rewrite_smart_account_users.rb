@@ -27,7 +27,8 @@
 #   RPC_URL             JSON-RPC to tell contract wallets from EOAs
 #                       (default: siwe_ethereum_rpc_url)
 #   SKIP_CODE_CHECK=1   run without an RPC (contract wallets get rewritten too)
-#   SUSPECT_AFTER       ISO time; rows created later with no proof of their
+#   SUSPECT_AFTER       ISO time with Z or an offset (no zone: UTC); rows
+#                       created later with no proof of their
 #                       owner are left for review. Set it to the first deploy
 #                       of a build with the Light Account login (8a4f838 or
 #                       later): 8a4f838 itself signed in as S without
@@ -40,6 +41,10 @@
 #                       and accept as they are
 #   KEEP_USERNAMES=1    do not rename usernames cut from the old address
 #                       (display names and info are still renamed)
+#
+# SUSPECT_AFTER, REVIEWED_ROWS, KEEP_USERNAMES, MERGE_DUPLICATES and
+# SKIP_CODE_CHECK change the plan: give the dry run, the apply and the
+# verify the same ones.
 
 plugin_root = File.expand_path("..", __dir__)
 # Load this checkout's code even when an older plugin version is running.

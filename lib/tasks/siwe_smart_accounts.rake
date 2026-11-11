@@ -11,6 +11,15 @@
 #   MERGE_DUPLICATES=1, FULL_BACKUP_TAKEN=1, SUSPECT_AFTER=<ISO time>,
 #   NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1, KEEP_USERNAMES=1, REVIEWED_ROWS=<ids>,
 #   RPC_URL=<json-rpc>, SKIP_CODE_CHECK=1, FORUM_ADDRESS_MAP=<path>.
+#
+# SUSPECT_AFTER, REVIEWED_ROWS, KEEP_USERNAMES, MERGE_DUPLICATES and
+# SKIP_CODE_CHECK change the plan: give every dry run, apply and verify the
+# same ones, or a verify reports rows the apply left on purpose. On a forum
+# where the Light Account login was already live (staging):
+#
+#   SUSPECT_AFTER=2026-10-15T16:00:00Z rake siwe:smart_accounts:transfer
+#   SUSPECT_AFTER=2026-10-15T16:00:00Z rake 'siwe:smart_accounts:transfer[apply]'
+#   SUSPECT_AFTER=2026-10-15T16:00:00Z rake siwe:smart_accounts:verify
 namespace :siwe do
   namespace :smart_accounts do
     load_runner = lambda do

@@ -137,6 +137,10 @@ class FakeForum
     tables
   end
 
+  def backup_runs
+    TransferFixtures::REWRITE.backup_runs(@backups.flat_map { |b| b[:tables] })
+  end
+
   def delete_account(id)
     step(:delete_account)
     @rows.delete(id)
@@ -989,6 +993,228 @@ end
 
 # Environment variables -> options. The Discourse store is replaced by the
 # in-memory forum; SmartAccountTransferRunner::Store needs a live Discourse.
+# Two users on one address in different case: the first rewrite stored S
+# lowercase, and the login of that build then made a second user on the
+# checksummed S. provider_uid is unique case-sensitively, so both rows exist.
+class SharedAddressTest < Minitest::Test
+  include TransferHelpers
+
+  MERGE = { apply: true, merge: true, full_backup_taken: true }.freeze
+
+  # User 1: the original member, moved to lowercase S by the first rewrite.
+  # User 2: created by a later sign-in as checksummed S.
+  def case_pair_forum(second_created_at: T0 + 60)
+    forum = FakeForum.new
+    forum.add_user(1, username: EOA_UID[0, 20], name: EOA_UID, posts: 4, groups: %w[members])
+    forum.add_row(1, 1, SMART.downcase, info: { 'nickname' => EOA_UID, 'name' => EOA_UID })
+    forum.fields[1]['wallet_address'] = SMART.downcase
+    forum.add_smart_user(2, SMART, created_at: second_created_at, posts: 1, badges: %w[og])
+  end
+
+  def test_the_same_light_account_in_two_cases_is_a_duplicate_not_two_moved_accounts
+    plan = plan_for(case_pair_forum)
+    assert_equal %i[duplicate adopt], plan.map { |p| p[:status] }
+    assert_equal SMART, plan[0][:to]
+    assert_equal EOA, plan[0][:eoa]
+    assert_equal 2, plan[0][:other][:id]
+  end
+
+  def test_the_dry_run_says_the_apply_would_fail_and_the_apply_does_not_hit_the_unique_index
+    forum = case_pair_forum
+    result = transfer(forum).run
+    assert_equal 1, result[:verification][:unresolved].size
+    assert_includes output, 'An apply with these options would FAIL verification'
+    assert_includes output, 'merge the two with MERGE_DUPLICATES=1'
+
+    result = transfer(forum, apply: true).run
+    assert_equal :verification_failed, result[:status]
+    assert_equal [SMART.downcase, SMART], forum.rows.values.map { |r| r[:uid] }
+    assert_equal EOA, forum.fields[2]['siwe_owner_address'] # the other row is still completed
+  end
+
+  def test_the_pair_is_merged_onto_the_older_user
+    forum = case_pair_forum
+    result = transfer(forum, **MERGE).run
+    assert result[:ok], output
+    assert_equal [1], forum.users.keys
+    assert_equal({ 1 => SMART }, forum.rows.map { |id, r| [id, r[:uid]] }.to_h)
+    assert_equal SMART.downcase, forum.fields[1]['wallet_address']
+    assert_equal EOA, forum.fields[1]['siwe_owner_address']
+    assert_equal 5, forum.users[1][:posts]
+    assert_equal %w[members], forum.users[1][:groups]
+    assert_equal %w[og], forum.users[1][:badges]
+    assert_equal SMART[0, 20], forum.users[1][:username]
+    assert_equal SMART, forum.users[1][:name]
+    assert_equal 1, result[:counts][:merged]
+
+    after = forum.state
+    assert transfer(forum, **MERGE.merge(run_id: 'r2')).run[:ok]
+    assert_equal after, forum.state
+  end
+
+  def test_the_checksummed_user_survives_when_it_is_the_older_one
+    forum = case_pair_forum(second_created_at: T0 - 60)
+    result = transfer(forum, **MERGE).run
+    assert result[:ok], output
+    assert_equal [2], forum.users.keys
+    assert_equal({ 2 => SMART }, forum.rows.map { |id, r| [id, r[:uid]] }.to_h)
+    assert_equal EOA, forum.fields[2]['siwe_owner_address']
+    assert_equal 5, forum.users[2][:posts]
+  end
+
+  def test_the_same_wallet_in_two_cases_is_one_rewrite_and_one_duplicate
+    forum = FakeForum.new.add_wallet_user(1, EOA_UID, posts: 2)
+    forum.add_user(2, username: 'second', name: 'Second', created_at: T0 + 60, posts: 3)
+    forum.add_row(2, 2, EOA)
+    assert_equal %i[duplicate rewrite], plan_for(forum).map { |p| p[:status] }
+
+    result = transfer(forum, apply: true).run
+    assert_equal :verification_failed, result[:status]
+    assert_equal [EOA_UID, SMART], forum.rows.values.map { |r| r[:uid] }
+
+    result = transfer(forum, **MERGE.merge(run_id: 'r2')).run
+    assert result[:ok], output
+    assert_equal [1], forum.users.keys
+    assert_equal({ 1 => SMART }, forum.rows.map { |id, r| [id, r[:uid]] }.to_h)
+    assert_equal 5, forum.users[1][:posts]
+  end
+
+  def test_three_users_on_one_address_are_a_conflict_and_nothing_of_them_is_written
+    forum = case_pair_forum.add_wallet_user(3, EOA_UID, created_at: T0 - 60)
+    forum.add_wallet_user(4, EOA2_UID)
+    assert_equal %i[conflict conflict conflict rewrite], plan_for(forum).map { |p| p[:status] }
+
+    before = forum.rows.values.first(3).map { |r| r[:uid] }
+    result = transfer(forum, **MERGE).run
+    assert_equal :verification_failed, result[:status]
+    assert_equal 3, result[:verification][:unresolved].size
+    assert_includes output, "shares #{SMART} with user"
+    assert_includes output, 'merge these users in the admin UI'
+    assert_equal before, forum.rows.values.first(3).map { |r| r[:uid] }
+    assert_equal [1, 2, 3, 4], forum.users.keys
+    assert_equal SMART2, forum.rows[4][:uid] # the others are still transferred
+  end
+
+  def test_a_pair_with_no_proven_owner_is_a_conflict
+    rows = [
+      { id: 1, user_id: 1, username: 'a', uid: SMART2, owner: nil, created_at: T0 },
+      { id: 2, user_id: 2, username: 'b', uid: SMART2.downcase, owner: nil, created_at: T0 },
+    ]
+    plan = REWRITE.plan(rows, code_for: ->(_) { LA.proxy_runtime_code }, known_pairs: PAIRS)
+    assert_equal %i[conflict conflict], plan.map { |p| p[:status] }
+    refute REWRITE.verify(plan, REWRITE.transfers(plan, merge: true))[:ok]
+  end
+
+  def test_a_recase_replaces_an_orphan_row_that_holds_the_checksummed_uid
+    forum = FakeForum.new
+    forum.add_user(1, username: 'chosen', name: 'Chosen')
+    forum.add_row(1, 1, SMART.downcase)
+    forum.add_row(9, nil, SMART)
+    result = transfer(forum, apply: true).run
+    assert result[:ok], output
+    assert_equal({ 1 => SMART }, forum.rows.map { |id, r| [id, r[:uid]] }.to_h)
+    assert_includes output, 'delete siwe row     9 (no user)'
+  end
+
+  def test_a_merged_pair_also_replaces_an_orphan_row_on_the_light_account
+    forum = FakeForum.new.add_wallet_user(1, EOA_UID, posts: 2)
+    forum.add_user(2, username: 'second', name: 'Second', created_at: T0 + 60, posts: 3)
+    forum.add_row(2, 2, SMART.downcase)
+    forum.add_row(9, nil, SMART)
+    result = transfer(forum, **MERGE).run
+    assert result[:ok], output
+    assert_equal [1], forum.users.keys
+    assert_equal({ 1 => SMART }, forum.rows.map { |id, r| [id, r[:uid]] }.to_h)
+    assert_equal 2, result[:counts][:rows_deleted]
+    assert_includes output, '1 duplicate users merged, 1 orphan rows replaced'
+  end
+end
+
+# A re-run after a failure backs up a forum that is already partly
+# transferred. The output must not present that backup as the way back.
+class RollbackPointTest < Minitest::Test
+  include TransferHelpers
+
+  MERGE = { apply: true, merge: true, full_backup_taken: true }.freeze
+
+  def test_backup_runs_lists_complete_sets_oldest_first
+    names = %w[
+      siwe_backup_20261111153000_accounts siwe_backup_20261111153000_fields siwe_backup_20261111153000_users
+      siwe_backup_20261111153000_group_users siwe_backup_20261111153000_user_badges
+      siwe_backup_20261015160000_accounts siwe_backup_20261015160000_fields siwe_backup_20261015160000_users
+      siwe_backup_20260101000000_accounts siwe_backup_20260101000000_fields
+      siwe_backup_accounts users
+    ]
+    assert_equal %w[20261015160000 20261111153000], REWRITE.backup_runs(names)
+    assert_empty REWRITE.backup_runs([])
+  end
+
+  def test_a_first_apply_mentions_no_earlier_backup
+    forum = FakeForum.new.add_wallet_user(1, EOA2_UID)
+    assert transfer(forum, apply: true).run[:ok]
+    refute_includes output, 'Earlier backups exist'
+    assert_includes output, 'use it right after the apply, with wallet sign-ins still off'
+  end
+
+  def test_a_re_run_after_a_failed_merge_points_at_the_first_backup
+    forum = FakeForum.new.add_wallet_user(1, EOA2_UID).add_smart_user(2, SMART2, created_at: T0 + 60)
+    forum.add_wallet_user(3, EOA3_UID)
+    forum.fail_on = { merge_users: 1 }
+    assert_raises(RuntimeError) { transfer(forum, **MERGE).run }
+    assert_includes output, 'if it still exists after the re-run, merge it into user 1 from its admin page'
+    assert_equal EOA3_UID, forum.backups[0][:rows][3][:uid]
+
+    result = transfer(forum, **MERGE.merge(run_id: 'r2')).run
+    assert result[:ok], output
+    assert_equal SMART3, forum.backups[1][:rows][3][:uid] # the second backup is not the original state
+    assert_includes output, 'Earlier backups exist: siwe_backup_r1_*.'
+    assert_includes output, 'the backup of that first apply (oldest here: r1), not r2'
+    assert_includes output, "use the same SQL with that apply's run id (oldest here: r1) in place of r2"
+  end
+end
+
+# A dry run, an apply and a verify agree only with the same options.
+class PlanOptionsTest < Minitest::Test
+  include TransferHelpers
+
+  def test_a_dry_run_without_the_login_confirmation_says_suspect_after_changes_the_plan
+    forum = FakeForum.new.add_wallet_user(1, EOA2_UID)
+    transfer(forum, no_login_deployed: false).run
+    assert_includes output, 'NOTE: an apply needs SUSPECT_AFTER or NO_LIGHT_ACCOUNT_LOGIN_DEPLOYED=1'
+
+    transfer(forum).run
+    refute_includes output, 'NOTE: an apply needs'
+    refute_includes output, 'These options change the plan'
+  end
+
+  def test_the_options_that_change_the_plan_are_printed_for_the_next_command
+    forum = FakeForum.new.add_wallet_user(1, EOA2_UID).add_wallet_user(2, EOA3_UID)
+    forum.rows[2][:created_at] = Time.utc(2026, 10, 16)
+    opts = { no_login_deployed: false, suspect_after: Time.utc(2026, 10, 15, 16), reviewed: [2], keep_usernames: true }
+    line = 'give the same ones to every dry run, apply and verify: ' \
+           'SUSPECT_AFTER=2026-10-15T16:00:00Z REVIEWED_ROWS=2 KEEP_USERNAMES=1'
+
+    transfer(forum, **opts).run
+    assert_includes output, line
+    assert transfer(forum, **opts.merge(apply: true)).run[:ok]
+    assert_includes output, line
+
+    # the same forum without them does not verify: the reason for the line
+    refute transfer(forum, no_login_deployed: false).verify[:ok]
+    assert transfer(forum, **opts).verify[:ok]
+  end
+
+  def test_suspect_after_without_a_zone_is_utc
+    parse = ->(text) { DiscourseSiwe::SmartAccountTransferRunner.parse_time(text) }
+    assert_equal Time.utc(2026, 10, 15, 16), parse.call('2026-10-15T16:00:00')
+    assert_equal Time.utc(2026, 10, 15, 16), parse.call('2026-10-15 16:00')
+    assert_equal Time.utc(2026, 10, 15, 16), parse.call('2026-10-15T16:00:00Z')
+    assert_equal Time.utc(2026, 10, 15, 14), parse.call('2026-10-15T16:00:00+02:00')
+    assert_equal Time.utc(2026, 10, 15, 18, 30), parse.call('2026-10-15T16:00-0230')
+    assert_equal Time.utc(2026, 10, 15), parse.call('2026-10-15')
+  end
+end
+
 class TransferRunnerEnvTest < Minitest::Test
   include TransferHelpers
 

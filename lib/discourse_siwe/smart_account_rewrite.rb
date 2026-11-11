@@ -14,7 +14,9 @@ module DiscourseSiwe
 
     # Statuses that change nothing. :adopt and :recase only record the owner
     # and/or fix the case; :rewrite and :duplicate move the uid.
-    SKIP = %i[invalid orphan already smart_of light_account contract unknown_code review].freeze
+    # :conflict is a set of users sharing one address that the tool cannot
+    # sort out by itself (see resolve_shared_addresses).
+    SKIP = %i[invalid orphan already smart_of light_account contract unknown_code review conflict].freeze
 
     # forum-address-map.json is either { eoa => smart } or chain-keyed
     # { "1" => { eoa => smart }, "11155111" => { ... } }.
@@ -53,6 +55,9 @@ module DiscourseSiwe
     #
     # Returns one { row:, status:, from:, to:, other:, owner:, note: } per
     # row; owner is the EOA to store in siwe_owner_address, when missing.
+    # A :duplicate made by resolve_shared_addresses also has eoa: (its from
+    # is then a Light Account, not the wallet). blocker: is an orphan row
+    # holding exactly the uid the entry is about to get.
     def plan(rows, code_for: nil, suspect_after: nil, known_pairs: [])
       known = { owner_of_smart: {}, eoas: {} }
       known_pairs.each do |eoa, smart|
@@ -60,8 +65,10 @@ module DiscourseSiwe
         known[:eoas][eoa.to_s.downcase] = true
       end
 
-      by_uid = {}
-      rows.each { |r| by_uid[r[:uid].to_s.downcase] = r }
+      # provider_uid is unique case-sensitively, so one address can sit in
+      # several rows that differ only in case: keep all of them.
+      by_uid = Hash.new { |h, k| h[k] = [] }
+      rows.each { |r| by_uid[r[:uid].to_s.downcase] << r }
 
       derived = {}
       rows.each do |r|
@@ -74,7 +81,70 @@ module DiscourseSiwe
         smart_of[s.downcase] ||= r if s
       end
 
-      rows.map { |r| plan_row(r, derived[r[:id]], by_uid, smart_of, code_for, suspect_after, known) }
+      entries = rows.map { |r| plan_row(r, derived[r[:id]], by_uid, smart_of, code_for, suspect_after, known) }
+      resolve_shared_addresses(entries, by_uid)
+    end
+
+    # Statuses that write a provider_uid (entry[:to]).
+    MOVES_UID = %i[rewrite duplicate recase].freeze
+
+    # Two rows with a user can end on one address without plan_row seeing it:
+    # the same Light Account stored in two cases (the first rewrite wrote S
+    # lowercase and the login of that build then made a second, checksummed
+    # row), or the same wallet in two cases. Writing both would hit the
+    # unique index and roll the whole run back. Such a pair becomes a
+    # :duplicate (merged with MERGE_DUPLICATES=1, unresolved without); three
+    # or more users, or a pair with no proven owner, become :conflict.
+    #
+    # Also marks an orphan row that holds exactly the uid an entry is about
+    # to get (blocker:), so it is deleted first.
+    def resolve_shared_addresses(entries, by_uid)
+      final = ->(e) { (MOVES_UID.include?(e[:status]) ? e[:to] : e[:from]).to_s.downcase }
+      groups = Hash.new { |h, k| h[k] = [] }
+      entries.each do |e|
+        next if e[:status] == :invalid || e[:row][:user_id].nil?
+
+        groups[final.call(e)] << e
+      end
+
+      groups.each do |address, group|
+        next if group.size < 2
+        next if group.size == 2 && linked_duplicate?(group[0], group[1])
+
+        checksummed = LightAccount.checksum(address)
+        moves = group.map { |e| address_move(e, merge: true) }
+        if group.size == 2 && moves.all?
+          # The row that already has the final uid, if any, keeps its plan.
+          keep = group.find { |e| e[:from] == checksummed } || group.max_by { |e| e[:row][:id] }
+          dup = group.find { |e| !e.equal?(keep) }
+          dup.merge!(
+            status: :duplicate, to: checksummed, other: keep[:row], eoa: moves[0][0].to_s.downcase,
+            note: "#{checksummed} is also the account of user #{keep[:row][:user_id]} " \
+                  "(#{keep[:row][:username]}, row #{keep[:row][:id]})",
+          )
+        else
+          others = ->(e) { group.reject { |o| o.equal?(e) }.map { |o| "#{o[:row][:user_id]} (row #{o[:row][:id]})" } }
+          group.each do |e|
+            e.merge!(
+              status: :conflict, to: nil, other: nil,
+              note: "shares #{checksummed} with user #{others.call(e).join(', ')}",
+            )
+          end
+        end
+      end
+
+      entries.each do |e|
+        next unless MOVES_UID.include?(e[:status]) && e[:to]
+
+        blocker = by_uid[e[:to].downcase].find { |r| r[:user_id].nil? && r[:uid] == e[:to] && r[:id] != e[:row][:id] }
+        e[:blocker] = blocker if blocker
+      end
+      entries
+    end
+
+    # A :duplicate and the row it names.
+    def linked_duplicate?(a, b)
+      [[a, b], [b, a]].any? { |d, o| d[:status] == :duplicate && d[:other] && d[:other][:id] == o[:row][:id] }
     end
 
     def plan_row(row, smart, by_uid, smart_of, code_for, suspect_after, known = { owner_of_smart: {}, eoas: {} })
@@ -149,20 +219,22 @@ module DiscourseSiwe
         return entry.merge(status: :review, to: smart, note: "created after #{suspect_after}")
       end
 
-      existing = by_uid[smart.downcase]
-      if existing && existing[:id] != row[:id]
-        # A row for S with no user (UserMerger leaves one when both users had
-        # a siwe row) only blocks the unique index: it is replaced.
-        if existing[:user_id].nil?
-          return entry.merge(
-            status: :rewrite, to: smart, other: existing,
-            note: "replaces orphan row #{existing[:id]} (no user) holding #{smart}",
-          )
-        end
-
+      holders = by_uid[smart.downcase].reject { |r| r[:id] == row[:id] }
+      existing = holders.find { |r| r[:user_id] }
+      if existing
         return entry.merge(
           status: :duplicate, to: smart, other: existing,
           note: "#{smart} already used by user #{existing[:user_id]} (#{existing[:username]})",
+        )
+      end
+
+      # A row for S with no user (UserMerger leaves one when both users had
+      # a siwe row) only blocks the unique index: it is replaced.
+      orphan = holders.find { |r| r[:uid] == smart } || holders.first
+      if orphan
+        return entry.merge(
+          status: :rewrite, to: smart, other: orphan,
+          note: "replaces orphan row #{orphan[:id]} (no user) holding #{smart}",
         )
       end
 
@@ -192,7 +264,7 @@ module DiscourseSiwe
       when :rewrite
         [entry[:from], entry[:to]]
       when :duplicate
-        merge ? [entry[:from], entry[:to]] : nil
+        merge ? [entry[:eoa] || entry[:from], entry[:to]] : nil
       when :already, :adopt, :recase
         owner = entry[:owner] || entry[:row][:owner]
         LightAccount.valid_address?(owner) ? [owner, LightAccount.checksum(entry[:from])] : nil
@@ -277,6 +349,8 @@ module DiscourseSiwe
     #     uid:     { from:, to: } | nil    provider_uid to write
     #     delete:  account id | nil        siwe row to delete first (the merged
     #                                      user's row, or an orphan row on S)
+    #     delete_orphan: account id | nil  an orphan row on S that blocks the
+    #                                      uid of a merged pair as well
     #     merge:   { user_id:, username:, account_id: } | nil   user merged in
     #     moved:   true when the account changes address in this run
     #     fields:  [{ field:, from:, to: }]   custom fields
@@ -316,15 +390,20 @@ module DiscourseSiwe
         transfer = {
           account_id: target[:id], user_id: target[:user_id], username: target[:username],
           status: p[:status], eoa: eoa, smart: smart, uid: nil, delete: nil, merge: nil,
-          moved: %i[rewrite duplicate].include?(p[:status]),
+          delete_orphan: nil, moved: %i[rewrite duplicate].include?(p[:status]),
         }
         transfer[:uid] = { from: target[:uid], to: smart } unless target[:uid] == smart
+        blocker = transfer[:uid] && p[:blocker] && p[:blocker][:id]
         if pair
           loser = pair[:loser]
           transfer[:merge] = { user_id: loser[:user_id], username: loser[:username], account_id: loser[:id] }
           transfer[:delete] = loser[:id]
+          transfer[:delete_orphan] = blocker if blocker
         elsif p[:status] == :rewrite && p[:other]
           transfer[:delete] = p[:other][:id]
+          transfer[:delete_orphan] = blocker if blocker && blocker != p[:other][:id]
+        elsif blocker
+          transfer[:delete] = blocker
         end
         transfer[:fields] = field_changes(target, eoa, smart)
 
@@ -342,7 +421,7 @@ module DiscourseSiwe
     end
 
     def changes?(transfer)
-      !!(transfer[:uid] || transfer[:delete] || transfer[:merge]) ||
+      !!(transfer[:uid] || transfer[:delete] || transfer[:delete_orphan] || transfer[:merge]) ||
         transfer[:fields].any? || transfer[:renames].any?
     end
 
@@ -397,6 +476,8 @@ module DiscourseSiwe
       when :duplicate
         "user #{other[:user_id]} (#{other[:username]}) already signed in as #{entry[:to]}; " \
           'merge the two with MERGE_DUPLICATES=1'
+      when :conflict
+        "#{entry[:note]}; merge these users in the admin UI until at most two are left, then run again"
       when :smart_of
         "Light Account of user #{other[:user_id]} (#{other[:username]}), a duplicate that is not merged"
       when :review
@@ -437,6 +518,20 @@ module DiscourseSiwe
         tables << ["#{prefix}_user_badges", "SELECT * FROM user_badges WHERE user_id IN (#{ids.join(', ')})"]
       end
       tables
+    end
+
+    BACKUP_PARTS = %w[accounts fields users].freeze
+
+    # Run ids, oldest first, of the complete backups (the three tables
+    # restore_sql reads) among `table_names`. Run ids are UTC start times,
+    # so they sort by age.
+    def backup_runs(table_names)
+      parts = Hash.new { |h, k| h[k] = [] }
+      table_names.each do |name|
+        m = /\Asiwe_backup_([0-9a-z_]+?)_(accounts|fields|users)\z/.match(name.to_s)
+        parts[m[1]] << m[2] if m && m[1].match?(RUN_ID_RE)
+      end
+      parts.select { |_, have| (BACKUP_PARTS - have).empty? }.keys.sort
     end
 
     # SQL that puts back what the transfer wrote outside merges: provider_uid
