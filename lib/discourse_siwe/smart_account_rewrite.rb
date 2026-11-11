@@ -142,5 +142,70 @@ module DiscourseSiwe
       w = wallet.to_s.downcase
       "#{w[0..5]}…#{w[-4..-1]}"
     end
+
+    # A username Discourse cut from an address: 0x plus at least 8 hex digits.
+    ADDRESS_USERNAME_RE = /\A0x[0-9a-fA-F]{8,40}\z/.freeze
+
+    # [eoa, smart] of the user a plan entry leaves on a Light Account, or nil
+    # when the entry moves nothing or the owner is unknown. Covers rows moved
+    # by an earlier run (:already, :adopt, :recase), so a re-run still fixes
+    # the names an older version of the script left behind.
+    def address_move(entry, merge: false)
+      case entry[:status]
+      when :rewrite
+        [entry[:from], entry[:to]]
+      when :duplicate
+        merge ? [entry[:from], entry[:to]] : nil
+      when :already, :adopt, :recase
+        owner = entry[:owner] || entry[:row][:owner]
+        LightAccount.valid_address?(owner) ? [owner, LightAccount.checksum(entry[:from])] : nil
+      end
+    end
+
+    # The fields the login derived from the old address, and what a fresh
+    # Light Account login would have put there instead.
+    #
+    # fields: { name:, username:, info_nickname:, info_name: } as they are now
+    #   name          - users.name. New users get the full SIWE address from
+    #                   the strategy; DisplayNameApplier then shortens it when
+    #                   Society resolution is on.
+    #   username      - users.username. Discourse cuts it from the address
+    #                   (the strategy's nickname) at max_username_length.
+    #   info_nickname, info_name - the associated account's info json.
+    # short_name: true when a fresh login gets the short form as its name
+    #   (siwe_society_enabled); a full-address name then becomes short.
+    # username_for: ->(checksummed_smart) { username }, e.g.
+    #   UserNameSuggester.suggest; default cuts S to the old length.
+    #
+    # Only a value recognisably made from eoa is replaced: the full address in
+    # any case, its short form, or a username that is a prefix of it. A chosen
+    # name, a Society name or an ENS name never matches. Returns
+    # [{ field:, from:, to: }], empty once everything is renamed.
+    def derived_renames(fields, eoa, smart, short_name: false, username_for: nil)
+      return [] unless LightAccount.valid_address?(eoa) && LightAccount.valid_address?(smart)
+      return [] if LightAccount.same_address?(eoa, smart)
+
+      full = LightAccount.checksum(smart)
+      out = []
+
+      name = fields[:name].to_s.strip
+      if LightAccount.same_address?(name, eoa)
+        out << { field: :name, from: fields[:name], to: short_name ? short_wallet(smart) : full }
+      elsif name == short_wallet(eoa)
+        out << { field: :name, from: fields[:name], to: short_wallet(smart) }
+      end
+
+      username = fields[:username].to_s
+      if username.match?(ADDRESS_USERNAME_RE) && eoa.downcase.start_with?(username.downcase)
+        to = username_for ? username_for.call(full) : full[0, username.length]
+        out << { field: :username, from: username, to: to } if to && to != username
+      end
+
+      %i[info_nickname info_name].each do |field|
+        out << { field: field, from: fields[field], to: full } if LightAccount.same_address?(fields[field].to_s.strip, eoa)
+      end
+
+      out
+    end
   end
 end
