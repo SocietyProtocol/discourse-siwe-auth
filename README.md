@@ -476,7 +476,7 @@ and writes only what is still different:
 | Account info | `nickname` / `name` in the row's `info` json | `S` when they held `E` |
 | Society cache | `society_resolved_at` custom field | deleted for accounts moved in this run, so the next sign-in looks the profile up again for `S` (with `E` as fallback) |
 | A duplicate user | a second user who already signed in as `S` | merged into the original with Discourse's `UserMerger` (`MERGE_DUPLICATES=1`): posts, likes, groups, badges, notifications, bookmarks and emails end on one user |
-| A leftover row | a `siwe` row for `S` with no user | deleted, because it blocks the unique index. `UserMerger` leaves such a row when both merged users had a `siwe` row, for example after a merge in the admin UI |
+| A leftover row | a `siwe` row for `S` with no user | deleted, because it blocks the unique index. `UserMerger` leaves such a row when both merged users had a `siwe` row, for example after a merge in the admin UI (Discourse's own daily cleanup removes it later) |
 | Sync counters | plugin store rows `group_sync_pending` and `badge_mirror_pending` (how many runs a user was seen without a badge) | dropped for the users moved or merged in this run, so nobody leaves a group or loses a mirrored badge on counts gathered for the old address: the full number of confirmations applies again |
 | Badge sync debounce | `siwe_badges_synced_at` custom field | deleted for the same users: their next sign-in mirrors badges at once |
 
@@ -500,7 +500,10 @@ It deliberately leaves:
 - contract wallets (`contract`), rows whose uid is not an address (`invalid`),
   rows with no user (`orphan`) and deployed Light Accounts whose owner is not
   known yet (`light_account`; recorded at their next sign-in). These are the
-  recognised skips.
+  recognised skips. A contract wallet keeps its own address as uid. The
+  sign-in page always signs in as the Light Account of the connected address,
+  so such a member does not reach that account through it: decide separately
+  how they sign in.
 
 #### How it decides
 
@@ -586,8 +589,8 @@ app: raise the container's memory limit first if it has one.
 2. **Deploy this plugin version** (rebuild or roll out the image). Sign-ins
    stay off. If you cannot deploy first, clone the plugin where the container
    can read it and use the script instead of the rake task in the steps below.
-3. **Take a full backup** (`discourse backup`, or the admin Backups page) and
-   keep it. It is the only way back from a merge.
+3. **Take a full backup** (`discourse backup`, the admin Backups page, or a
+   dump of the database) and keep it. It is the only way back from a merge.
 4. **Dry run** and read all of it:
 
    ```bash
@@ -624,7 +627,9 @@ Turn off **Discourse siwe enabled** first, and roll the plugin back to the
 previous version afterwards.
 
 *No merge happened.* Run the SQL the apply printed (it is also what
-`DiscourseSiwe::SmartAccountRewrite.restore_sql('<run>')` returns):
+`DiscourseSiwe::SmartAccountRewrite.restore_sql('<run>')` returns). With a
+database outside the container, paste it into `bundle exec rails dbconsole -p`
+instead of `psql`:
 
 ```bash
 sudo -u postgres psql discourse <<'SQL'
