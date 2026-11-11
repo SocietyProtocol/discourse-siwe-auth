@@ -541,6 +541,14 @@ unless its derivation matches every pair in `script/forum-address-map.json`
   memberships and badges (`siwe_backup_<run>_group_users`,
   `siwe_backup_<run>_user_badges`) as a record of who had what. The two
   counter rows of the plugin store go to `siwe_backup_<run>_plugin_store`.
+- **Sync counters come last.** After the accounts are written, the apply
+  drops the group sync and badge mirror counters of the transferred users
+  under the locks of those jobs. If a full group sync or badge mirror run is
+  in progress, the apply waits for it without printing anything (up to that
+  run's length) before it verifies. If this step fails, the apply prints a
+  warning and the transfer still stands; the step is not repeated by a
+  re-run, so those users keep their old counters, which can only bring a
+  pending removal forward by runs that were already counted.
 - **Transactions.** The backup and every account that is not part of a merge
   are one transaction: if anything fails, nothing is written and no backup
   table is left. A merge cannot be part of it: `UserMerger` is run the way
