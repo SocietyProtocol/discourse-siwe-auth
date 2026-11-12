@@ -52,6 +52,34 @@ module DiscourseSiwe
       nil
     end
 
+    # eth_getCode at `latest`. Returns code hex without 0x ('' for an EOA),
+    # or nil when the RPC is unreachable. `url` overrides the site setting
+    # (used by script/rewrite_smart_account_users.rb).
+    def get_code(address, url: rpc_url)
+      return nil unless url
+
+      uri = URI(url)
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = uri.scheme == 'https'
+      http.open_timeout = 10
+      http.read_timeout = 10
+
+      req = Net::HTTP::Post.new(uri.path.empty? ? '/' : uri.path, 'Content-Type' => 'application/json')
+      req.body = {
+        jsonrpc: '2.0',
+        method: 'eth_getCode',
+        params: [address, 'latest'],
+        id: 1
+      }.to_json
+
+      result = JSON.parse(http.request(req).body)
+      return nil if result['error'] || !result['result'].is_a?(String)
+
+      remove_hex_prefix(result['result'])
+    rescue StandardError
+      nil
+    end
+
     def encode_address(addr)
       remove_hex_prefix(addr).downcase.rjust(64, '0')
     end

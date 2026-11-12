@@ -45,6 +45,23 @@ module DiscourseSiwe
       new(wallet_address).resolve
     end
 
+    # The forum address is the member's Light Account, whose Society profile
+    # may not exist yet. Fall back to the owner EOA's profile in that case.
+    def self.resolve_with_owner(wallet_address, owner_address)
+      society = resolve(wallet_address)
+      return society if profile?(society)
+      return society if owner_address.to_s.strip.empty?
+      return society if owner_address.to_s.downcase == wallet_address.to_s.downcase
+
+      resolve(owner_address) || society
+    end
+
+    def self.profile?(society)
+      return false unless society
+
+      !society[:badge_id].to_s.strip.empty? || !society[:name].to_s.strip.empty?
+    end
+
     def initialize(wallet_address)
       @wallet_address = wallet_address.to_s.downcase
     end
