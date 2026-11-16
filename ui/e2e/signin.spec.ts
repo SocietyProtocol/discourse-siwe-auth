@@ -30,7 +30,17 @@ type Fixtures = {
   errors: string[]
   /** Hosts outside the stub the page tried to reach (refused). */
   outside: string[]
+  /**
+   * mountSiwe calls and shadow roots attached to #siwe-mount, one entry per
+   * page load, and uncaught page errors. After every test it fails when a
+   * page mounted the wallet UI more than once or threw (on the forum a
+   * second mount threw "Shadow root cannot be created on a host which
+   * already hosts a shadow tree").
+   */
+  mounts: { loads: MountCount[]; pageErrors: string[] }
 }
+
+type MountCount = { mountSiwe: number; shadowRoots: number }
 
 const test = base.extend<Fixtures>({
   stub: async ({}, use) => {
@@ -44,6 +54,45 @@ const test = base.extend<Fixtures>({
     page.on('pageerror', (e) => errors.push(e.message))
     await use(errors)
   },
+  mounts: [
+    async ({ page }, use) => {
+      const mounts = { loads: [] as MountCount[], pageErrors: [] as string[] }
+      page.on('pageerror', (e) => mounts.pageErrors.push(e.stack ?? e.message))
+      await page.exposeFunction('__siweProbe', (kind: string) => {
+        if (kind === 'load') mounts.loads.push({ mountSiwe: 0, shadowRoots: 0 })
+        else mounts.loads[mounts.loads.length - 1][kind as keyof MountCount]++
+      })
+      await page.addInitScript(() => {
+        const probe = (window as unknown as { __siweProbe: (k: string) => void })
+          .__siweProbe
+        void probe('load')
+        const attach = Element.prototype.attachShadow
+        Element.prototype.attachShadow = function (init) {
+          if (this.id === 'siwe-mount') void probe('shadowRoots')
+          return attach.call(this, init)
+        }
+        // The bundle assigns window.mountSiwe; count the calls to it.
+        let mount: unknown
+        Object.defineProperty(window, 'mountSiwe', {
+          configurable: true,
+          get: () => mount,
+          set: (fn: (...a: unknown[]) => unknown) => {
+            mount = function (this: unknown, ...a: unknown[]) {
+              void probe('mountSiwe')
+              return fn.apply(this, a)
+            }
+          },
+        })
+      })
+      await use(mounts)
+      expect(mounts.pageErrors, 'uncaught errors on the page').toEqual([])
+      for (const load of mounts.loads) {
+        expect(load.mountSiwe, 'mountSiwe calls on one page').toBeLessThanOrEqual(1)
+        expect(load.shadowRoots, 'shadow roots on #siwe-mount').toBeLessThanOrEqual(1)
+      }
+    },
+    { auto: true },
+  ],
   outside: async ({ context, stub }, use) => {
     const outside: string[] = []
     const local = new URL(stub.origin).host
@@ -128,6 +177,21 @@ for (const [label, info] of [
     })
   }
 }
+
+// On the forum a second instance of the controller mounted the bundle again
+// on the same #siwe-mount, which threw. Also shows the mounts probe counts.
+test('mounts the wallet UI once, without page errors', async ({
+  page,
+  stub,
+  mounts,
+}) => {
+  await installWallet(page, GENERIC)
+  const mount = await openAuth(page, stub, { walletConnect: true })
+  await expect(walletButton(mount, GENERIC.name)).toBeVisible()
+  await page.waitForTimeout(500)
+  expect(mounts.loads).toEqual([{ mountSiwe: 1, shadowRoots: 1 }])
+  expect(mounts.pageErrors).toEqual([])
+})
 
 test('lists MetaMask, WalletConnect and Safe once each', async ({
   page,

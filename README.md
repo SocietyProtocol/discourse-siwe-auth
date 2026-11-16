@@ -393,7 +393,7 @@ The forum serves the bundle with `cache-control: public, max-age=31536000,
 immutable`, and Cloudflare caches it, so a rebuilt bundle at the same URL would
 not reach anyone for a year. The build therefore writes the bundle's content
 hash into `assets/javascripts/discourse/lib/siwe-bundle-version.js`, and
-`controllers/siwe-auth/index.js` loads
+`controllers/siwe-auth.js` loads
 `/plugins/discourse-siwe-auth/javascripts/siwe.iife.js?v=<hash>` (Discourse
 ignores the query string). Commit that module together with the bundle.
 
@@ -414,8 +414,8 @@ bundle with `node ui/scripts/check-bundle.mjs`.
 ### Browser test of the sign-in bundle
 
 `ui/e2e` loads the committed `public/javascripts/siwe.iife.js` in Chromium the
-way the forum does (from the versioned URL in `siwe-bundle-version.js`) (the page from `templates/siwe-auth/index.gjs`, mounted as
-`controllers/siwe-auth/index.js` does) against a local stand-in for the
+way the forum does (from the versioned URL in `siwe-bundle-version.js`) (the page from `templates/siwe-auth.gjs`, mounted as
+`controllers/siwe-auth.js` does) against a local stand-in for the
 Discourse routes it calls (`ui/e2e/discourse-stub.ts`: the message endpoint
 and the OmniAuth callback, with the Light Account signature checked offline).
 A test wallet is injected over EIP-1193 and EIP-6963, once announced as
@@ -423,7 +423,11 @@ MetaMask (`io.metamask`) and once as a generic wallet, and each test clicks it
 through connect, signature and the callback post. The WalletConnect and Safe
 buttons are clicked too, and must reach for the WalletConnect relay instead of
 failing on a missing package. Every request outside `127.0.0.1` is refused,
-so the test needs no network and no secrets.
+so the test needs no network and no secrets. Each test also fails when a page
+mounts the wallet UI more than once or throws an uncaught error, and
+`ui/e2e/plugin-layout.spec.ts` fails when a controller or route lives in an
+`index.js` module (`controllers/siwe-auth/index.js` was built by Ember for
+both `siwe-auth` and `siwe-auth.index`, and the page mounted twice).
 
 ```bash
 cd ui && npm ci --ignore-scripts && npx playwright install chromium
@@ -432,7 +436,7 @@ SIWE_BUNDLE=/path/to/siwe.iife.js npm run test:e2e   # any other bundle
 ```
 
 `.github/workflows/sign-in-ui.yml` runs it on pushes and pull requests that
-touch `ui/`, the bundle or its version module, then rebuilds and fails if the
+touch `ui/`, the bundle or `assets/javascripts/discourse/`, then rebuilds and fails if the
 committed bundle or version module differs from what `ui/` builds.
 
 ## How it works
