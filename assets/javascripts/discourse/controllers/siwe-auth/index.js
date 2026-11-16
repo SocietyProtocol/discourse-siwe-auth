@@ -1,7 +1,7 @@
 import Controller from "@ember/controller";
 import { withPluginApi } from "discourse/lib/plugin-api";
 import loadScript from "discourse/lib/load-script";
-import { SIWE_BUNDLE_URL } from "../lib/siwe-bundle-version";
+import { SIWE_BUNDLE_URL } from "../../lib/siwe-bundle-version";
 
 export default class SiweAuthIndexController extends Controller {
   constructor() {

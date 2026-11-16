@@ -393,7 +393,7 @@ The forum serves the bundle with `cache-control: public, max-age=31536000,
 immutable`, and Cloudflare caches it, so a rebuilt bundle at the same URL would
 not reach anyone for a year. The build therefore writes the bundle's content
 hash into `assets/javascripts/discourse/lib/siwe-bundle-version.js`, and
-`controllers/siwe-auth-index.js` loads
+`controllers/siwe-auth/index.js` loads
 `/plugins/discourse-siwe-auth/javascripts/siwe.iife.js?v=<hash>` (Discourse
 ignores the query string). Commit that module together with the bundle.
 
@@ -414,8 +414,8 @@ bundle with `node ui/scripts/check-bundle.mjs`.
 ### Browser test of the sign-in bundle
 
 `ui/e2e` loads the committed `public/javascripts/siwe.iife.js` in Chromium the
-way the forum does (from the versioned URL in `siwe-bundle-version.js`) (the page from `templates/siwe-auth-index.gjs`, mounted as
-`controllers/siwe-auth-index.js` does) against a local stand-in for the
+way the forum does (from the versioned URL in `siwe-bundle-version.js`) (the page from `templates/siwe-auth/index.gjs`, mounted as
+`controllers/siwe-auth/index.js` does) against a local stand-in for the
 Discourse routes it calls (`ui/e2e/discourse-stub.ts`: the message endpoint
 and the OmniAuth callback, with the Light Account signature checked offline).
 A test wallet is injected over EIP-1193 and EIP-6963, once announced as

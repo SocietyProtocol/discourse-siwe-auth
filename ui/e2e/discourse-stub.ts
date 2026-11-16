@@ -16,7 +16,7 @@ import {
   lightAccountAddress,
   lightAccountSignRequest,
 } from '../src/lightAccount'
-// The module controllers/siwe-auth-index.js loads the bundle URL from.
+// The module controllers/siwe-auth/index.js loads the bundle URL from.
 import { SIWE_BUNDLE_URL } from '../../assets/javascripts/discourse/lib/siwe-bundle-version.js'
 import { BUNDLE_URL_PATH } from '../scripts/bundle-version.mjs'
 
@@ -24,8 +24,8 @@ import { BUNDLE_URL_PATH } from '../scripts/bundle-version.mjs'
  * A stand-in for the parts of Discourse the sign-in page talks to, so the
  * built bundle can be loaded and clicked through without a forum:
  *
- *   GET  /discourse-siwe/auth      the page from templates/siwe-auth-index.gjs,
- *                                   mounted as controllers/siwe-auth-index.js does
+ *   GET  /discourse-siwe/auth      the page from templates/siwe-auth/index.gjs,
+ *                                   mounted as controllers/siwe-auth/index.js does
  *   GET  /plugins/discourse-siwe-auth/javascripts/siwe.iife.js   the bundle,
  *                                   whatever the query string (as Discourse
  *                                   serves it); the page asks for it as
