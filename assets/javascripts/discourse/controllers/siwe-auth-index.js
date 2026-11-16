@@ -1,6 +1,7 @@
 import Controller from "@ember/controller";
 import { withPluginApi } from "discourse/lib/plugin-api";
 import loadScript from "discourse/lib/load-script";
+import { SIWE_BUNDLE_URL } from "../lib/siwe-bundle-version";
 
 export default class SiweAuthIndexController extends Controller {
   constructor() {
@@ -24,7 +25,9 @@ export default class SiweAuthIndexController extends Controller {
         .querySelector('meta[name="csrf-token"]')
         ?.getAttribute("content") || "";
 
-    await loadScript("/plugins/discourse-siwe-auth/javascripts/siwe.iife.js");
+    // siwe.iife.js?v=<content hash>: Discourse serves the bundle as immutable,
+    // so only a new URL makes browsers and the CDN fetch a rebuilt bundle.
+    await loadScript(SIWE_BUNDLE_URL);
 
     if (window.mountSiwe) {
       window.mountSiwe("#siwe-mount", {

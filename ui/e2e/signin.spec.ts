@@ -1,5 +1,5 @@
 import { test as base, expect, type Page } from '@playwright/test'
-import { fileURLToPath } from 'node:url'
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { startDiscourseStub, type DiscourseStub } from './discourse-stub'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
@@ -9,19 +9,20 @@ import {
   lightAccountSignRequest,
   wrapLightAccountSignature,
 } from '../src/lightAccount'
+import {
+  SIWE_BUNDLE_URL,
+  SIWE_BUNDLE_VERSION,
+} from '../../assets/javascripts/discourse/lib/siwe-bundle-version.js'
+import { BUNDLE_FILE, bundleVersion } from '../scripts/bundle-version.mjs'
 
 /**
  * Loads the built bundle (public/javascripts/siwe.iife.js, or SIWE_BUNDLE)
- * the way the forum does, in Chromium, and clicks through the sign-in.
+ * the way the forum does (from the versioned URL the controller uses), in
+ * Chromium, and clicks through the sign-in.
  * Nothing leaves 127.0.0.1: every other request and WebSocket is refused
  * and recorded.
  */
-const BUNDLE = resolve(
-  process.env.SIWE_BUNDLE ??
-    fileURLToPath(
-      new URL('../../public/javascripts/siwe.iife.js', import.meta.url),
-    ),
-)
+const BUNDLE = resolve(process.env.SIWE_BUNDLE ?? BUNDLE_FILE)
 
 type Fixtures = {
   stub: DiscourseStub
@@ -81,6 +82,8 @@ async function openAuth(
   await page.waitForFunction(
     () => (window as unknown as { __siweMounted?: boolean }).__siweMounted,
   )
+  // Loaded from the URL the controller uses, with the version query string.
+  expect(stub.bundleRequests).toEqual([SIWE_BUNDLE_URL])
   return page.locator('#siwe-mount')
 }
 
@@ -164,6 +167,20 @@ for (const button of ['WalletConnect', 'Safe']) {
       .toBe('reached for the WalletConnect relay')
   })
 }
+
+// The bundle is served as immutable, so the controller loads it as
+// siwe.iife.js?v=<content hash>; a stale hash would keep the old bundle in
+// browsers and the CDN for a year.
+test('the controller loads the bundle by its content hash', async () => {
+  expect(SIWE_BUNDLE_URL).toBe(
+    `/plugins/discourse-siwe-auth/javascripts/siwe.iife.js?v=${SIWE_BUNDLE_VERSION}`,
+  )
+  test.skip(
+    BUNDLE !== BUNDLE_FILE,
+    'SIWE_BUNDLE is not the committed bundle, so the committed hash is not for it',
+  )
+  expect(SIWE_BUNDLE_VERSION).toBe(bundleVersion(readFileSync(BUNDLE)))
+})
 
 // Guards the stand-in itself: a callback it accepts must be one the plugin
 // would accept, so it has to turn down a signature from the wrong key.
