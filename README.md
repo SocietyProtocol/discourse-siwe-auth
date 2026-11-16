@@ -373,6 +373,24 @@ SOCIETY_ADDRESS=0x... \
 for f in test/*_unit_test.rb; do ruby -r./test/support/pure_keccak -rtime "$f"; done
 ```
 
+### Rebuild the sign-in UI
+
+The wallet UI in `ui/` is built into `public/javascripts/siwe.iife.js`, which
+is committed (the forum image does not build it):
+
+```bash
+cd ui && npm ci --ignore-scripts && npm run build
+```
+
+`npm run build` type-checks, builds, then runs `scripts/check-bundle.mjs`,
+which fails when the bundle holds a `Could not resolve "<pkg>"` stub. Such a
+stub builds fine but throws only when someone clicks that wallet: the wallet
+SDKs are optional peer dependencies of `@wagmi/connectors`, so they must be
+listed in `ui/package.json` for every connector `ui/src/wagmi.ts` creates.
+`ui/package-lock.json` is the lockfile the build uses; `ui/pnpm-lock.yaml` is
+kept in step with `pnpm import` after a change. Check an existing bundle with
+`node ui/scripts/check-bundle.mjs`.
+
 ## How it works
 
 When a user clicks the Ethereum login button, the plugin opens a dedicated

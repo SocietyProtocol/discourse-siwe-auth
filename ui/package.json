@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc --noEmit && vite build",
+    "build": "vue-tsc --noEmit && vite build && node scripts/check-bundle.mjs",
+    "check-bundle": "node scripts/check-bundle.mjs",
     "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {
@@ -16,6 +17,7 @@
     "@wagmi/connectors": "^8.0.9",
     "@wagmi/core": "^3.4.8",
     "@wagmi/vue": "^0.5.11",
+    "@walletconnect/ethereum-provider": "^2.26.0",
     "viem": "^2.48.8",
     "vue": "^3.5.33"
   },
