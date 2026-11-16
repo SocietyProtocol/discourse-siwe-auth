@@ -373,6 +373,48 @@ SOCIETY_ADDRESS=0x... \
 for f in test/*_unit_test.rb; do ruby -r./test/support/pure_keccak -rtime "$f"; done
 ```
 
+### Rebuild the sign-in UI
+
+The wallet UI in `ui/` is built into `public/javascripts/siwe.iife.js`, which
+is committed (the forum image does not build it):
+
+```bash
+cd ui && npm ci --ignore-scripts && npm run build
+```
+
+`npm run build` type-checks, builds, then runs `scripts/check-bundle.mjs`,
+which fails when the bundle holds a `Could not resolve "<pkg>"` stub. Such a
+stub builds fine but throws only when someone clicks that wallet: the wallet
+SDKs are optional peer dependencies of `@wagmi/connectors`, so they must be
+listed in `ui/package.json` for every connector `ui/src/wagmi.ts` creates.
+`ui/package-lock.json` is the lockfile the build uses; `ui/pnpm-lock.yaml` is
+kept in step with `pnpm import` after a change. Check an existing bundle with
+`node ui/scripts/check-bundle.mjs`.
+
+### Browser test of the sign-in bundle
+
+`ui/e2e` loads the committed `public/javascripts/siwe.iife.js` in Chromium the
+way the forum does (the page from `templates/siwe-auth-index.gjs`, mounted as
+`controllers/siwe-auth-index.js` does) against a local stand-in for the
+Discourse routes it calls (`ui/e2e/discourse-stub.ts`: the message endpoint
+and the OmniAuth callback, with the Light Account signature checked offline).
+A test wallet is injected over EIP-1193 and EIP-6963, once announced as
+MetaMask (`io.metamask`) and once as a generic wallet, and each test clicks it
+through connect, signature and the callback post. The WalletConnect and Safe
+buttons are clicked too, and must reach for the WalletConnect relay instead of
+failing on a missing package. Every request outside `127.0.0.1` is refused,
+so the test needs no network and no secrets.
+
+```bash
+cd ui && npm ci --ignore-scripts && npx playwright install chromium
+npm run test:e2e                                  # the committed bundle
+SIWE_BUNDLE=/path/to/siwe.iife.js npm run test:e2e   # any other bundle
+```
+
+`.github/workflows/sign-in-ui.yml` runs it on pushes and pull requests that
+touch `ui/` or the bundle, then rebuilds and fails if the committed bundle
+differs from what `ui/` builds.
+
 ## How it works
 
 When a user clicks the Ethereum login button, the plugin opens a dedicated
