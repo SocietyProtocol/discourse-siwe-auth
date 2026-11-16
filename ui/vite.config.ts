@@ -1,7 +1,19 @@
-import { readFileSync, writeFileSync, unlinkSync, readdirSync } from 'fs'
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  unlinkSync,
+  readdirSync,
+} from 'fs'
 import { resolve } from 'path'
 import { defineConfig, type Plugin } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import {
+  BUNDLE_FILE,
+  VERSION_MODULE_FILE,
+  bundleVersion,
+  versionModule,
+} from './scripts/bundle-version.mjs'
 
 /**
  * After Vite writes the build output, reads any extracted CSS files,
@@ -39,8 +51,42 @@ function cssToShadow(): Plugin {
   }
 }
 
+/**
+ * After the bundle is final (runs after css-to-shadow), writes its content
+ * hash into assets/javascripts/discourse/lib/siwe-bundle-version.js, which
+ * the controller loads the bundle with (`siwe.iife.js?v=<hash>`). The bundle
+ * is served as immutable, so a new URL is the only way a new bundle reaches
+ * browsers and the CDN. See scripts/bundle-version.mjs.
+ */
+function bundleVersionModule(): Plugin {
+  let outDir = ''
+  return {
+    name: 'siwe-bundle-version',
+    configResolved(config) {
+      outDir = resolve(config.root, config.build.outDir)
+    },
+    // After every other closeBundle hook, so the CSS is already prepended.
+    closeBundle: {
+      order: 'post',
+      sequential: true,
+      handler() {
+        const jsPath = resolve(outDir, 'siwe.iife.js')
+        // Only the committed bundle has a committed version module.
+        if (jsPath !== BUNDLE_FILE || !existsSync(jsPath)) return
+        const text = versionModule(bundleVersion(readFileSync(jsPath)))
+        if (
+          !existsSync(VERSION_MODULE_FILE) ||
+          readFileSync(VERSION_MODULE_FILE, 'utf8') !== text
+        ) {
+          writeFileSync(VERSION_MODULE_FILE, text)
+        }
+      },
+    },
+  }
+}
+
 export default defineConfig({
-  plugins: [vue(), cssToShadow()],
+  plugins: [vue(), cssToShadow(), bundleVersionModule()],
   define: {
     'process.env.NODE_ENV': JSON.stringify('production'),
   },

@@ -382,8 +382,17 @@ is committed (the forum image does not build it):
 cd ui && npm ci --ignore-scripts && npm run build
 ```
 
+The forum serves the bundle with `cache-control: public, max-age=31536000,
+immutable`, and Cloudflare caches it, so a rebuilt bundle at the same URL would
+not reach anyone for a year. The build therefore writes the bundle's content
+hash into `assets/javascripts/discourse/lib/siwe-bundle-version.js`, and
+`controllers/siwe-auth-index.js` loads
+`/plugins/discourse-siwe-auth/javascripts/siwe.iife.js?v=<hash>` (Discourse
+ignores the query string). Commit that module together with the bundle.
+
 `npm run build` type-checks, builds, then runs `scripts/check-bundle.mjs`,
-which fails when the bundle holds a `Could not resolve "<pkg>"` stub. Such a
+which fails when the bundle holds a `Could not resolve "<pkg>"` stub, or when
+the hash in `siwe-bundle-version.js` does not match the committed bundle. Such a
 stub builds fine but throws only when someone clicks that wallet: the wallet
 SDKs are optional peer dependencies of `@wagmi/connectors`, so they must be
 listed in `ui/package.json` for every connector `ui/src/wagmi.ts` creates.
@@ -394,7 +403,7 @@ kept in step with `pnpm import` after a change. Check an existing bundle with
 ### Browser test of the sign-in bundle
 
 `ui/e2e` loads the committed `public/javascripts/siwe.iife.js` in Chromium the
-way the forum does (the page from `templates/siwe-auth-index.gjs`, mounted as
+way the forum does (from the versioned URL in `siwe-bundle-version.js`) (the page from `templates/siwe-auth-index.gjs`, mounted as
 `controllers/siwe-auth-index.js` does) against a local stand-in for the
 Discourse routes it calls (`ui/e2e/discourse-stub.ts`: the message endpoint
 and the OmniAuth callback, with the Light Account signature checked offline).
@@ -412,8 +421,8 @@ SIWE_BUNDLE=/path/to/siwe.iife.js npm run test:e2e   # any other bundle
 ```
 
 `.github/workflows/sign-in-ui.yml` runs it on pushes and pull requests that
-touch `ui/` or the bundle, then rebuilds and fails if the committed bundle
-differs from what `ui/` builds.
+touch `ui/`, the bundle or its version module, then rebuilds and fails if the
+committed bundle or version module differs from what `ui/` builds.
 
 ## How it works
 

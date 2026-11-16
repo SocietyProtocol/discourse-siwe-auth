@@ -16,6 +16,9 @@ import {
   lightAccountAddress,
   lightAccountSignRequest,
 } from '../src/lightAccount'
+// The module controllers/siwe-auth-index.js loads the bundle URL from.
+import { SIWE_BUNDLE_URL } from '../../assets/javascripts/discourse/lib/siwe-bundle-version.js'
+import { BUNDLE_URL_PATH } from '../scripts/bundle-version.mjs'
 
 /**
  * A stand-in for the parts of Discourse the sign-in page talks to, so the
@@ -23,7 +26,10 @@ import {
  *
  *   GET  /discourse-siwe/auth      the page from templates/siwe-auth-index.gjs,
  *                                   mounted as controllers/siwe-auth-index.js does
- *   GET  /plugins/discourse-siwe-auth/javascripts/siwe.iife.js   the bundle
+ *   GET  /plugins/discourse-siwe-auth/javascripts/siwe.iife.js   the bundle,
+ *                                   whatever the query string (as Discourse
+ *                                   serves it); the page asks for it as
+ *                                   SIWE_BUNDLE_URL (siwe.iife.js?v=<hash>)
  *   GET  /discourse-siwe/message   AuthController#message (same checks, same
  *                                   EIP-4361 text, nonce kept per server)
  *   POST /auth/siwe/callback       the OmniAuth callback: checks domain and
@@ -46,6 +52,8 @@ export type DiscourseStub = {
   callbacks: Callback[]
   /** Path of the bundle being served. */
   bundlePath: string
+  /** Paths with query string of every request for the bundle. */
+  bundleRequests: string[]
   close: () => Promise<void>
 }
 
@@ -58,7 +66,8 @@ export const FAKE_WC_PROJECT_ID = '00000000000000000000000000e2e000'
 
 function authPage(walletConnectProjectId: string | undefined) {
   // Mirrors the template (hidden form + mount point) and the controller
-  // (loadScript, then window.mountSiwe with the same options).
+  // (loadScript(SIWE_BUNDLE_URL), which adds a script tag with that src, then
+  // window.mountSiwe with the same options).
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -76,7 +85,7 @@ function authPage(walletConnectProjectId: string | undefined) {
   const settings = ${JSON.stringify({ projectId: walletConnectProjectId ?? '', statement: STATEMENT })};
   const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
   const s = document.createElement('script');
-  s.src = '/plugins/discourse-siwe-auth/javascripts/siwe.iife.js';
+  s.src = ${JSON.stringify(SIWE_BUNDLE_URL)};
   s.onload = () => {
     if (window.mountSiwe) {
       window.mountSiwe('#siwe-mount', {
@@ -198,6 +207,7 @@ export async function startDiscourseStub(
 ): Promise<DiscourseStub> {
   const bundle = readFileSync(bundlePath)
   const callbacks: Callback[] = []
+  const bundleRequests: string[] = []
   // One "session": the tests run one page at a time against a stub.
   let sessionNonce: string | undefined
 
@@ -212,10 +222,8 @@ export async function startDiscourseStub(
           authPage(url.searchParams.get('wc') ? FAKE_WC_PROJECT_ID : undefined),
         )
       }
-      if (
-        req.method === 'GET' &&
-        url.pathname === '/plugins/discourse-siwe-auth/javascripts/siwe.iife.js'
-      ) {
+      if (req.method === 'GET' && url.pathname === BUNDLE_URL_PATH) {
+        bundleRequests.push(url.pathname + url.search)
         res.writeHead(200, { 'content-type': 'application/javascript' })
         return res.end(bundle)
       }
@@ -275,6 +283,7 @@ export async function startDiscourseStub(
     origin: `http://127.0.0.1:${port}`,
     callbacks,
     bundlePath,
+    bundleRequests,
     close: () => new Promise((resolve) => server.close(() => resolve())),
   }
 }

@@ -4,15 +4,22 @@
 // code that throws 'Could not resolve "<pkg>"' only when a user clicks the
 // connector, so the build itself still succeeds.
 //
+// For the committed bundle it also fails when the content hash in
+// assets/javascripts/discourse/lib/siwe-bundle-version.js does not match it:
+// the controller loads the bundle by that hash, and a stale hash means
+// browsers and the CDN keep serving the old bundle (see bundle-version.mjs).
+//
 // Usage: node scripts/check-bundle.mjs [path/to/siwe.iife.js]
 import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
+import { resolve } from 'node:path'
+import {
+  BUNDLE_FILE,
+  VERSION_MODULE_FILE,
+  bundleVersion,
+  committedVersion,
+} from './bundle-version.mjs'
 
-const file =
-  process.argv[2] ??
-  fileURLToPath(
-    new URL('../../public/javascripts/siwe.iife.js', import.meta.url),
-  )
+const file = resolve(process.argv[2] ?? BUNDLE_FILE)
 
 const js = readFileSync(file, 'utf8')
 const stubs = [
@@ -31,3 +38,20 @@ if (stubs.length) {
 }
 
 console.log(`${file}: no unresolved-import stubs (${js.length} bytes)`)
+
+if (file === BUNDLE_FILE) {
+  const actual = bundleVersion(readFileSync(file))
+  const committed = committedVersion()
+  if (committed !== actual) {
+    console.error(
+      `${VERSION_MODULE_FILE} has version ${committed}, but the bundle's hash is ${actual}.\n` +
+        'Rebuild with npm run build (it rewrites the module), and commit both files.',
+    )
+    process.exit(1)
+  }
+  console.log(`${VERSION_MODULE_FILE}: version ${actual} matches the bundle`)
+} else {
+  console.log(
+    `(not the committed bundle, so the version module is not checked; its hash is ${bundleVersion(readFileSync(file))})`,
+  )
+}

@@ -2,16 +2,25 @@ name: Sign-in UI
 
 # Loads the committed wallet bundle (public/javascripts/siwe.iife.js) in
 # Chromium against a local Discourse stand-in and signs in with a test
-# wallet, then checks the bundle is what ui/ builds. No secrets, no network
+# wallet, then checks the bundle (and the content hash the controller loads
+# it by) is what ui/ builds. No secrets, no network
 # beyond installing packages and the browser.
 on:
   push:
     branches: [main, staging]
     paths:
-      ['ui/**', 'public/javascripts/**', '.github/workflows/sign-in-ui.yml']
+      - 'ui/**'
+      - 'public/javascripts/**'
+      - 'assets/javascripts/discourse/lib/siwe-bundle-version.js'
+      - 'assets/javascripts/discourse/controllers/siwe-auth-index.js'
+      - '.github/workflows/sign-in-ui.yml'
   pull_request:
     paths:
-      ['ui/**', 'public/javascripts/**', '.github/workflows/sign-in-ui.yml']
+      - 'ui/**'
+      - 'public/javascripts/**'
+      - 'assets/javascripts/discourse/lib/siwe-bundle-version.js'
+      - 'assets/javascripts/discourse/controllers/siwe-auth-index.js'
+      - '.github/workflows/sign-in-ui.yml'
 
 permissions:
   contents: read
@@ -39,8 +48,11 @@ jobs:
           CI: '1'
       - name: Build (type-check, build, no missing-package stubs)
         run: npm run build
-      - name: The committed bundle is what ui/ builds
-        run: git diff --exit-code --stat -- ../public/javascripts/siwe.iife.js
+      - name: The committed bundle and its version are what ui/ builds
+        run: >-
+          git diff --exit-code --stat --
+          ../public/javascripts/siwe.iife.js
+          ../assets/javascripts/discourse/lib/siwe-bundle-version.js
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
