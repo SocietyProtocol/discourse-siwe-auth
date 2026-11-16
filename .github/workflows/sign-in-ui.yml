@@ -39,6 +39,8 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: ui/package-lock.json
+      - name: ui/ has one lockfile (npm's package-lock.json)
+        run: test ! -e pnpm-lock.yaml && test ! -e yarn.lock && test ! -e bun.lock
       - run: npm ci --ignore-scripts
       - run: npm run typecheck
       - run: npx playwright install --with-deps chromium
