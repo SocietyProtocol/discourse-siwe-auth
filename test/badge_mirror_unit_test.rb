@@ -156,12 +156,15 @@ class ContentTest < Minitest::Test
     hostile = ['a@' * 600_000, '<script ' * 130_000, '<' * 1_000_000, '<!--' * 250_000, '![' * 500_000, '[a](' * 250_000,
                '[a][' * 250_000, ' ' * 1_000_000 + '1.', '&amp;' * 200_000, 'http://' * 140_000, "\n#" * 500_000, '[' * 1_000_000,
                "\uFDFA" * 100_000, '&#x0' * 250_000, "\t" * 1_000_000 + '-']
+    # CPU time, not wall-clock time: a slow or busy machine must not fail this,
+    # only a pattern that backtracks on the input.
     hostile.each do |input|
-      started = Time.now
+      started = Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID)
       Content.plain_text(input, Content::DESCRIPTION_MAX)
       Content.name(input)
       Content.long_description(input, 1, app_url: 'https://app.example.com')
-      assert_operator Time.now - started, :<, 1.0, "#{input[0, 12].inspect} took #{Time.now - started}s"
+      spent = Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID) - started
+      assert_operator spent, :<, 1.0, "#{input[0, 12].inspect} took #{spent}s of CPU time"
     end
   end
 
