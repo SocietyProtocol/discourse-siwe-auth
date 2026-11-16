@@ -1,0 +1,63 @@
+name: Plugin tests
+
+# Runs the standalone Ruby unit tests (test/*_unit_test.rb, as the README
+# describes). web3-app-subgraph is checked out next to the plugin so the test
+# that compares the embedded Badges query with the query gateway's registry
+# runs instead of skipping. No secrets, no network beyond the checkouts.
+on:
+  push:
+    branches: [main, staging]
+    paths:
+      - 'lib/**'
+      - 'test/**'
+      - 'plugin.rb'
+      - '.github/workflows/plugin-tests.yml'
+  pull_request:
+    paths:
+      - 'lib/**'
+      - 'test/**'
+      - 'plugin.rb'
+      - '.github/workflows/plugin-tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: discourse-siwe-auth
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: discourse-siwe-auth
+          persist-credentials: false
+      # Plugin main is compared with subgraph main, everything else (staging
+      # and pull requests into it) with subgraph staging.
+      - uses: actions/checkout@v4
+        with:
+          repository: SocietyProtocol/web3-app-subgraph
+          ref: ${{ (github.base_ref || github.ref_name) == 'main' && 'main' || 'staging' }}
+          path: web3-app-subgraph
+          persist-credentials: false
+          sparse-checkout: infra/query-gateway/generated/registry.js
+          sparse-checkout-cone-mode: false
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - name: Unit tests
+        run: |
+          status=0
+          for f in test/*_unit_test.rb; do
+            echo "::group::$f"
+            ruby -r./test/support/pure_keccak -rtime "$f" || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+      - name: The gateway-registry comparison ran (did not skip)
+        run: |
+          out=$(ruby -r./test/support/pure_keccak -rtime test/badge_mirror_unit_test.rb -n /gateway_registry/)
+          echo "$out"
+          echo "$out" | grep -q '1 runs, .* 0 failures, 0 errors, 0 skips'

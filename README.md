@@ -373,6 +373,13 @@ SOCIETY_ADDRESS=0x... \
 for f in test/*_unit_test.rb; do ruby -r./test/support/pure_keccak -rtime "$f"; done
 ```
 
+The test that compares the embedded Badges query with the query gateway's
+registry skips unless `web3-app-subgraph` is checked out next to this repo
+(`../web3-app-subgraph`). `.github/workflows/plugin-tests.yml` runs all unit
+tests on pushes and pull requests that touch `lib/`, `test/` or `plugin.rb`,
+with the subgraph checked out next to the plugin (its `main` for plugin
+`main`, otherwise its `staging`), and fails if that comparison skips.
+
 ### Rebuild the sign-in UI
 
 The wallet UI in `ui/` is built into `public/javascripts/siwe.iife.js`, which
@@ -396,9 +403,13 @@ the hash in `siwe-bundle-version.js` does not match the committed bundle. Such a
 stub builds fine but throws only when someone clicks that wallet: the wallet
 SDKs are optional peer dependencies of `@wagmi/connectors`, so they must be
 listed in `ui/package.json` for every connector `ui/src/wagmi.ts` creates.
-`ui/package-lock.json` is the lockfile the build uses; `ui/pnpm-lock.yaml` is
-kept in step with `pnpm import` after a change. Check an existing bundle with
-`node ui/scripts/check-bundle.mjs`.
+`ui/` uses npm only (`packageManager` in `ui/package.json`): `ui/package-lock.json`
+is its one lockfile, and `npm ci` installs exactly what it records. Do not add
+a pnpm or yarn lockfile; a second lockfile drifts and builds a different
+bundle. `@wagmi/connectors`, `@wagmi/core`, `@wagmi/vue` and `viem` are pinned
+to exact versions because each connectors release expects one core version;
+upgrade them together, rebuild, and run the browser test. Check an existing
+bundle with `node ui/scripts/check-bundle.mjs`.
 
 ### Browser test of the sign-in bundle
 
