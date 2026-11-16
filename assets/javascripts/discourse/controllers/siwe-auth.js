@@ -1,8 +1,9 @@
 import Controller from "@ember/controller";
 import { withPluginApi } from "discourse/lib/plugin-api";
 import loadScript from "discourse/lib/load-script";
+import { SIWE_BUNDLE_URL } from "../lib/siwe-bundle-version";
 
-export default class SiweAuthIndexController extends Controller {
+export default class SiweAuthController extends Controller {
   constructor() {
     super(...arguments);
     this.initAuth();
@@ -24,10 +25,15 @@ export default class SiweAuthIndexController extends Controller {
         .querySelector('meta[name="csrf-token"]')
         ?.getAttribute("content") || "";
 
-    await loadScript("/plugins/discourse-siwe-auth/javascripts/siwe.iife.js");
+    // siwe.iife.js?v=<content hash>: Discourse serves the bundle as immutable,
+    // so only a new URL makes browsers and the CDN fetch a rebuilt bundle.
+    await loadScript(SIWE_BUNDLE_URL);
 
-    if (window.mountSiwe) {
-      window.mountSiwe("#siwe-mount", {
+    // Mount once: a second mountSiwe on the same element throws (it already
+    // hosts the wallet UI's shadow root).
+    const host = document.querySelector("#siwe-mount");
+    if (window.mountSiwe && host && !host.shadowRoot) {
+      window.mountSiwe(host, {
         csrfToken,
         callbackUrl: "/auth/siwe/callback",
         messageUrl: "/discourse-siwe/message",

@@ -12,7 +12,9 @@ module Jobs
       wallet = user.custom_fields['wallet_address']
       return unless wallet.present?
 
-      society = DiscourseSiwe::IdentityResolver.resolve(wallet)
+      society = DiscourseSiwe::IdentityResolver.resolve_with_owner(
+        wallet, user.custom_fields['siwe_owner_address'],
+      )
       DiscourseSiwe::IdentityStore.store_society(user, society)
       user.save_custom_fields
       DiscourseSiwe::DisplayNameApplier.apply(user)

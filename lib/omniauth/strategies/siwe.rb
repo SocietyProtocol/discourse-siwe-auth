@@ -16,18 +16,29 @@ module OmniAuth
 
       option :fields, %i[eth_message eth_signature]
 
+      # Always EIP-55 checksummed: Discourse matches provider_uid exactly and
+      # the forum rewrite stores checksummed addresses.
       uid do
-        @verified_address
+        DiscourseSiwe::LightAccount.checksum(@verified_address)
       end
 
       info do
         ens_name, ens_avatar = DiscourseSiwe::EnsResolver.resolve(@verified_address)
+        if ens_name.nil? && @owner_address
+          ens_name, ens_avatar = DiscourseSiwe::EnsResolver.resolve(@owner_address)
+        end
         display_name = ens_name || @verified_address
         {
           nickname: display_name,
           name: display_name,
           image: ens_avatar
         }
+      end
+
+      # Owner EOA of the Light Account that signed in, when the signature
+      # proves it (see LightAccount.owner_from_signature).
+      extra do
+        { owner_address: @owner_address }
       end
 
       def request_phase
@@ -70,6 +81,8 @@ module OmniAuth
         end
 
         return fail!(failure_reason) if failure_reason
+
+        @owner_address = DiscourseSiwe::LightAccount.owner_from_signature(@verified_address, eth_signature)
 
         super
       end
