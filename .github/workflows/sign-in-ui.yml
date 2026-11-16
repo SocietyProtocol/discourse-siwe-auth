@@ -11,15 +11,13 @@ on:
     paths:
       - 'ui/**'
       - 'public/javascripts/**'
-      - 'assets/javascripts/discourse/lib/siwe-bundle-version.js'
-      - 'assets/javascripts/discourse/controllers/siwe-auth/index.js'
+      - 'assets/javascripts/discourse/**'
       - '.github/workflows/sign-in-ui.yml'
   pull_request:
     paths:
       - 'ui/**'
       - 'public/javascripts/**'
-      - 'assets/javascripts/discourse/lib/siwe-bundle-version.js'
-      - 'assets/javascripts/discourse/controllers/siwe-auth/index.js'
+      - 'assets/javascripts/discourse/**'
       - '.github/workflows/sign-in-ui.yml'
 
 permissions:
